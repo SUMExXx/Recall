@@ -181,7 +181,9 @@ class _HomePageState extends State<HomePage> {
       return;
     }
     if (!mounted) return;
-    final controller = TextEditingController(text: '/sdcard/models/');
+    final controller = TextEditingController(
+      text: '/sdcard/models/qwen2_5_v1_7b_instruct-geniex_qairt-w4a16-qualcomm_snapdragon_8_elite_gen5',
+    );
     final path = await showDialog<String>(
       context: context,
       builder: (ctx) => AlertDialog(
