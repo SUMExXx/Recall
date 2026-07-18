@@ -92,8 +92,10 @@ python dev.py hub --port 8000            # seeds demo_hub.db, serves :8000
 
 - Dashboard: http://localhost:8000 · web-mic capture: http://localhost:8000/capture
 - Capture devices connect to `ws://<hub>:8000/ws`: `hello` → `meeting_start` →
-  `utterance` (text) or binary PCM16 frames (transcribed in ~6 s windows via
-  `RECALL_WHISPER_URL`) → `button` (bookmark / forget_last) → `meeting_end`.
+  `utterance` (text) or binary PCM16 frames (transcribed in ~4 s windows,
+  in-process via faster-whisper by default; `RECALL_ASR_MODE=http` for an
+  external server) → `button` (bookmark / forget_last) → `meeting_end`.
+- Untitled captures are auto-titled from the first thing said.
 - MCP (Claude Desktop / Claude Code):
   `claude mcp add recall -- <pc>/.venv/Scripts/python.exe -m hub.mcp_server --db <pc>/demo_hub.db --backend ollama`
 

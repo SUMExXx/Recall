@@ -15,7 +15,9 @@ import hashlib
 import json
 
 from .config import RecallConfig
+from .llm_validate import is_valid_llm_summary
 from .store import MemoryStore
+from .tracing import ensure_trace, step
 
 _TOP_ENTITIES = 25
 
@@ -35,18 +37,28 @@ class OKFGenerator:
 
     def generate_all(self) -> dict:
         """(Re)build every OKF whose underlying content changed. Returns counts."""
-        counts = {"github_repo": 0, "meeting": 0, "pdf": 0}
-        for repo in self._distinct_chunk_col("github_repo", "repo"):
-            if self._gen_repo(repo):
-                counts["github_repo"] += 1
-        for meeting_id in self._distinct_meeting_ids():
-            if self._gen_meeting(meeting_id):
-                counts["meeting"] += 1
-        for doc in self._distinct_chunk_col("pdf", "document_title"):
-            if self._gen_pdf(doc):
-                counts["pdf"] += 1
-        self.store.commit()
-        return counts
+        with ensure_trace("okf_generate_all"):
+            counts = {"github_repo": 0, "meeting": 0, "pdf": 0}
+            for repo in self._distinct_chunk_col("github_repo", "repo"):
+                with step("okf:repo", repo=repo) as s:
+                    built = self._gen_repo(repo)
+                    s.detail(regenerated=built)
+                if built:
+                    counts["github_repo"] += 1
+            for meeting_id in self._distinct_meeting_ids():
+                with step("okf:meeting", meeting_id=meeting_id) as s:
+                    built = self._gen_meeting(meeting_id)
+                    s.detail(regenerated=built)
+                if built:
+                    counts["meeting"] += 1
+            for doc in self._distinct_chunk_col("pdf", "document_title"):
+                with step("okf:pdf", document_title=doc) as s:
+                    built = self._gen_pdf(doc)
+                    s.detail(regenerated=built)
+                if built:
+                    counts["pdf"] += 1
+            self.store.commit()
+            return counts
 
     # ---------------------------------------------------------- discovery
 
@@ -65,19 +77,33 @@ class OKFGenerator:
     def _maybe_summarize(self, fallback: str, facts: str) -> str:
         """LLM polish when available; else the extractive fallback."""
         if self.llm is not None and getattr(self.llm, "available", False):
-            try:
-                return self.llm.generate(
-                    "Summarize this source in 2-3 sentences for a table of "
-                    f"contents. Facts:\n{facts}", timeout=60)
-            except Exception:
-                pass
+            prompt = ("Summarize this source in 2-3 sentences for a table of "
+                      f"contents. Facts:\n{facts}")
+            with step("okf:llm_polish", model=getattr(self.llm, "model",
+                                                       self.llm.name)) as s:
+                s.detail(prompt=prompt)
+                try:
+                    text = self.llm.generate(prompt, timeout=60)
+                    s.detail(response=text)
+                    if is_valid_llm_summary(text, facts):
+                        return text
+                    s.detail(rejected="failed output validation "
+                                     "(refusal/off-topic/too short)")
+                except Exception as e:
+                    s.detail(fallback=f"LLM unavailable: {e}")
         return fallback
+
+    def _unchanged(self, source_type: str, source_key: str,
+                   content_hash: str) -> bool:
+        """Checked BEFORE building a manifest, so unchanged sources never cost
+        an LLM call on the periodic Dream pass."""
+        existing = self.store.get_okf(source_type, source_key)
+        return bool(existing and existing["content_hash"] == content_hash)
 
     def _save(self, source_type: str, source_key: str, manifest: dict,
               content_hash: str) -> bool:
-        existing = self.store.get_okf(source_type, source_key)
-        if existing and existing["content_hash"] == content_hash:
-            return False  # unchanged — skip regeneration
+        if self._unchanged(source_type, source_key, content_hash):
+            return False
         self.store.upsert_okf(source_type, source_key, manifest, content_hash)
         return True
 
@@ -101,18 +127,22 @@ class OKFGenerator:
             meta = json.loads(m["source_meta"] or "{}")
             imports.update(meta.get("imports", []))
             functions.update(meta.get("functions", []))
+        sorted_imports = sorted(imports)
+        sorted_functions = sorted(functions)
+        content_hash = _hash(repo, *files, *ents, *sorted_imports, *sorted_functions)
+        if self._unchanged("github_repo", repo, content_hash):
+            return False
         facts = (f"repo={repo}; files={files}; key_identifiers={ents}; "
-                 f"imports={sorted(imports)}; functions={sorted(functions)}")
+                 f"imports={sorted_imports}; functions={sorted_functions}")
         manifest = {
             "kind": "repo", "repo": repo,
             "files": files, "key_modules": files[:10],
-            "dependencies": sorted(imports), "functions": sorted(functions),
+            "dependencies": sorted_imports, "functions": sorted_functions,
             "entities": ents,
             "summary": self._maybe_summarize(
                 f"Repository {repo} with {len(files)} indexed file(s).", facts),
         }
-        return self._save("github_repo", repo, manifest,
-                          _hash(repo, *files, *ents))
+        return self._save("github_repo", repo, manifest, content_hash)
 
     def _gen_meeting(self, meeting_id: str) -> bool:
         mem = self.store.db.execute(
@@ -124,18 +154,23 @@ class OKFGenerator:
         meta = json.loads(mem["source_meta"] or "{}")
         decisions = meta.get("decisions", [])
         actions = meta.get("action_items", [])
-        facts = (f"title={mem['title']}; participants={meta.get('participants')}; "
+        participants = meta.get("participants", [])
+        title = mem["title"] or ""
+        summary = mem["summary"] or ""
+        content_hash = _hash(meeting_id, title, summary, *participants, *decisions, *actions)
+        if self._unchanged("meeting", meeting_id, content_hash):
+            return False
+        facts = (f"title={title}; participants={participants}; "
                  f"decisions={decisions}; action_items={actions}")
         manifest = {
-            "kind": "meeting", "meeting_id": meeting_id, "title": mem["title"],
-            "participants": meta.get("participants", []),
-            "agenda": (mem["summary"] or "")[:200],
+            "kind": "meeting", "meeting_id": meeting_id, "title": title,
+            "participants": participants,
+            "agenda": summary[:200],
             "decisions": decisions, "action_items": actions,
             "questions": meta.get("questions", []),
-            "summary": self._maybe_summarize(mem["summary"] or mem["title"], facts),
+            "summary": self._maybe_summarize(summary or title, facts),
         }
-        return self._save("meeting", meeting_id, manifest,
-                          _hash(meeting_id, *decisions, *actions))
+        return self._save("meeting", meeting_id, manifest, content_hash)
 
     def _gen_pdf(self, document_title: str) -> bool:
         rows = self.store.db.execute(
@@ -148,14 +183,18 @@ class OKFGenerator:
             (document_title,)).fetchone()
         meta = json.loads(mem["source_meta"] or "{}") if mem else {}
         headings = [meta[k] for k in ("heading", "chapter") if meta.get(k)]
-        facts = (f"title={document_title}; author={meta.get('author')}; "
+        author = meta.get("author", "")
+        summary = (mem["summary"] if mem else "") or ""
+        content_hash = _hash(document_title, author, summary, *map(str, pages), *headings)
+        if self._unchanged("pdf", document_title, content_hash):
+            return False
+        facts = (f"title={document_title}; author={author}; "
                  f"pages={pages}; headings={headings}")
         manifest = {
             "kind": "pdf", "document_title": document_title,
-            "author": meta.get("author", ""), "pages": pages,
+            "author": author, "pages": pages,
             "headings": headings,
             "summary": self._maybe_summarize(
-                (mem["summary"] if mem else "") or document_title, facts),
+                summary or document_title, facts),
         }
-        return self._save("pdf", document_title, manifest,
-                          _hash(document_title, *map(str, pages), *headings))
+        return self._save("pdf", document_title, manifest, content_hash)

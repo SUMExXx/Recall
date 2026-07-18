@@ -40,13 +40,14 @@ class RecallTools:
         if not ctxs:
             return "No matching memories."
         return "\n\n".join(
-            f"{c.citation()} ({c.source_type}: {c.title}, score "
+            f"{c.citation()} ({c.source_type}: {c.chunk_title or c.title}, score "
             f"{c.score:.3f})\n{c.text[:400]}" for c in ctxs)
 
     def ask(self, query: str, k: int = 6) -> str:
         out = self.retriever.ask(query, top_k=k)
-        srcs = "\n".join(f"  {c.citation()} {c.source_type}: {c.title}"
-                         for c in out.get("contexts", []))
+        srcs = "\n".join(
+            f"  {c.citation()} {c.source_type}: {c.chunk_title or c.title}"
+            for c in out.get("contexts", []))
         return f"{out.get('answer')}\n\nSources:\n{srcs or '  (none)'}"
 
     def bookmark_moment(self) -> str:

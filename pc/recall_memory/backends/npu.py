@@ -132,16 +132,29 @@ class QwenGenieLLM:
             return False
 
     def generate(self, prompt: str, *, json: bool = False,
-                 timeout: float = 180.0) -> str:
+                 schema: dict | None = None, timeout: float = 180.0) -> str:
         import requests
         body = {"model": self.model, "stream": False,
                 "messages": [{"role": "user", "content": prompt}]}
-        if json:
+        if schema is not None:
+            body["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {"name": "plan", "schema": schema}}
+        elif json:
             body["response_format"] = {"type": "json_object"}
-        r = requests.post(f"{self.endpoint}/v1/chat/completions",
-                          json=body, timeout=timeout)
-        r.raise_for_status()
-        return r.json()["choices"][0]["message"]["content"].strip()
+        try:
+            r = requests.post(f"{self.endpoint}/v1/chat/completions",
+                              json=body, timeout=timeout)
+            r.raise_for_status()
+            return r.json()["choices"][0]["message"]["content"].strip()
+        except requests.HTTPError as e:
+            if schema is not None and e.response is not None and e.response.status_code == 400:
+                body["response_format"] = {"type": "json_object"}
+                r = requests.post(f"{self.endpoint}/v1/chat/completions",
+                                  json=body, timeout=timeout)
+                r.raise_for_status()
+                return r.json()["choices"][0]["message"]["content"].strip()
+            raise e
 
 
 class QwenQnnReranker:

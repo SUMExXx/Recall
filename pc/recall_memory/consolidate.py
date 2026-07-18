@@ -19,9 +19,11 @@ import numpy as np
 
 from .config import DIM_FULL, RecallConfig
 from .extractors import llm_extract_relation
+from .llm_validate import is_valid_llm_summary
 from .nmo import now_epoch
 from .okf import OKFGenerator
 from .store import MemoryStore
+from .tracing import ensure_trace, step
 
 
 def _h(*parts: str) -> str:
@@ -37,6 +39,7 @@ class Consolidator:
         # the LLM (if any) rides along on the ingestor's backend — used by the
         # summary ladder and the §6 relation-extraction fallback; None on hash.
         self.llm = getattr(getattr(ingestor, "backend", None), "llm", None)
+        self._llm_attempted: set[int] = set()   # chunks already escalated once
 
     # ------------------------------------------------- job 1: duplicates
 
@@ -97,6 +100,8 @@ class Consolidator:
         chunk_ids = [r["chunk_id"] for r in self.store.db.execute(
             "SELECT chunk_id FROM chunks WHERE memory_id=?", (drop_id,))]
         self.store._delete_chunks(chunk_ids)
+        self.store.db.execute("DELETE FROM episodes WHERE memory_id=?", (drop_id,))
+        self.store.db.execute("UPDATE relations SET memory_id=? WHERE memory_id=?", (keep_id, drop_id))
         self.store.db.execute(
             "UPDATE memories SET archived=1, updated_at=? WHERE memory_id=?",
             (now_epoch(), drop_id))
@@ -339,18 +344,31 @@ class Consolidator:
 
     # --------------------------------------------- job 6: summary ladder
 
-    def _summarize(self, extractive: str, facts: str) -> str:
+    def _summarize(self, title: str, facts: str) -> str:
         if self.llm is not None and getattr(self.llm, "available", False):
-            try:
-                return self.llm.generate(
-                    f"Summarize in 2-3 sentences.\n{facts}", timeout=60)
-            except Exception:
-                pass
-        return extractive
+            prompt = (
+                "You are a summarization assistant. Summarize the following meeting details "
+                "in 2-3 sentences. Do not explain concepts or hallucinate details not present.\n\n"
+                f"Meeting Title: {title}\nFacts: {facts}"
+            )
+            with step("summarize:llm_polish", model=getattr(
+                    self.llm, "model", self.llm.name)) as s:
+                s.detail(prompt=prompt)
+                try:
+                    text = self.llm.generate(prompt, timeout=60)
+                    s.detail(response=text)
+                    if is_valid_llm_summary(text, facts or title):
+                        return text
+                    s.detail(rejected="failed output validation "
+                                     "(refusal/off-topic/too short)")
+                except Exception as e:
+                    s.detail(fallback=f"LLM unavailable: {e}")
+        return facts or title
 
     def job_summaries(self) -> int:
         """Chunk -> meeting -> daily ladder (plan §12 job 6). Regenerates only
-        changed levels; backfills empty NMO summaries so OKF/digest have text."""
+        changed levels — the content hash is checked BEFORE any LLM call, so an
+        idle Dream pass costs zero generations. Returns summaries (re)written."""
         n = 0
         for mem in self.store.db.execute(
                 "SELECT * FROM memories WHERE source_type='meeting' AND archived=0"):
@@ -361,9 +379,13 @@ class Consolidator:
             if meta.get("action_items"):
                 parts.append("Actions: " + "; ".join(meta["action_items"]))
             extractive = " ".join(parts) or mem["title"]
-            text = self._summarize(extractive, extractive)
             key = meta.get("meeting_id") or mem["memory_id"]
-            self.store.upsert_summary("meeting", key, text, _h(key, extractive))
+            h = _h(key, extractive)
+            existing = self.store.get_summary("meeting", key)
+            if existing and existing["content_hash"] == h:
+                continue                        # unchanged — skip the LLM
+            text = self._summarize(mem["title"], extractive)
+            self.store.upsert_summary("meeting", key, text, h)
             if not (mem["summary"] or "").strip():
                 self.store.db.execute(
                     "UPDATE memories SET summary=? WHERE memory_id=?",
@@ -376,10 +398,62 @@ class Consolidator:
             days.setdefault(day, []).append(mem["title"])
         for day, titles in days.items():
             text = " · ".join(titles[:20])
-            self.store.upsert_summary("daily", day, text, _h(day, text))
+            h = _h(day, text)
+            existing = self.store.get_summary("daily", day)
+            if existing and existing["content_hash"] == h:
+                continue
+            self.store.upsert_summary("daily", day, text, h)
             n += 1
         self.store.commit()
         return n
+
+    # ---------------------------------- job 7: re-embed on model upgrade
+
+    def job_reembed(self, batch_size: int = 200) -> int:
+        """Batched re-embedding when the model/pipeline version changes (plan
+        §12 job 7). Chunks tagged with an older `processing_version` get
+        fresh float[768]+int8[256] vectors from the CURRENT backend embedder;
+        a no-op once every chunk is already current. Low priority — bounded
+        to `batch_size` chunks per Dream pass so a large backlog (after a
+        model swap) doesn't turn one consolidation cycle into a multi-minute
+        re-embed of the whole store."""
+        from .config import PROCESSING_VERSION
+        from .embeddings import matryoshka_coarse
+        embedder = getattr(getattr(self.ingestor, "backend", None), "embedder", None)
+        if embedder is None:
+            return 0
+        rows = self.store.db.execute(
+            """SELECT c.chunk_id, c.text, c.created_at, c.source_type,
+                      m.rowid AS mem_rowid
+               FROM chunks c JOIN memories m ON m.memory_id = c.memory_id
+               WHERE c.processing_version != ? LIMIT ?""",
+            (PROCESSING_VERSION, batch_size)).fetchall()
+        if not rows:
+            return 0
+        texts = [r["text"] for r in rows]
+        sub_batch = 32
+        embeddings = []
+        for i in range(0, len(texts), sub_batch):
+            batch = texts[i:i + sub_batch]
+            embeddings.append(embedder.embed_documents(batch))
+        full = np.vstack(embeddings)
+        coarse = matryoshka_coarse(full)
+        for i, r in enumerate(rows):
+            self.store.db.execute(
+                "UPDATE chunks SET emb_full=?, processing_version=? WHERE chunk_id=?",
+                (full[i].astype(np.float32).tobytes(), PROCESSING_VERSION,
+                 r["chunk_id"]))
+            # vec0 virtual tables don't support partial-column UPDATE reliably —
+            # same delete+reinsert pattern MemoryStore.add_chunk uses.
+            self.store.db.execute(
+                "DELETE FROM vec_chunks WHERE chunk_id=?", (r["chunk_id"],))
+            self.store.db.execute(
+                """INSERT INTO vec_chunks(chunk_id, mem_rowid, created_at,
+                     source_type, emb_coarse) VALUES (?,?,?,?,vec_int8(?))""",
+                (r["chunk_id"], r["mem_rowid"], r["created_at"], r["source_type"],
+                 coarse[i].astype(np.int8).tobytes()))
+        self.store.commit()
+        return len(rows)
 
     # ---------------------------------------- job 8: dead-memory archival
 
@@ -437,13 +511,17 @@ class Consolidator:
         rows = self.store.db.execute(
             """SELECT chunk_id, memory_id, text FROM chunks
                WHERE source_type='meeting'
-                 AND memory_id NOT IN (SELECT DISTINCT memory_id FROM relations)
+                 AND chunk_id NOT IN (SELECT DISTINCT chunk_id FROM relations WHERE chunk_id IS NOT NULL)
                LIMIT ?""", (limit,)).fetchall()
         for r in rows:
+            if r["chunk_id"] in self._llm_attempted:
+                continue   # once per chunk — don't re-pay LLM cost every pass
+            self._llm_attempted.add(r["chunk_id"])
             rel = llm_extract_relation(r["text"], self.llm)
             if rel:
                 self.store.add_relation(r["memory_id"], rel["subject"],
-                                        rel["predicate"], rel["object"])
+                                        rel["predicate"], rel["object"],
+                                        chunk_id=r["chunk_id"])
                 added += 1
         self.store.commit()
         return added
@@ -455,23 +533,42 @@ class Consolidator:
 
     # ---------------------------------------------------------------- all
 
+    def _run_job(self, name: str, fn) -> int | dict:
+        """One consolidation job, timed as its own trace step (background
+        Dream-tier work — see plan §12)."""
+        with step(f"consolidate:{name}") as s:
+            result = fn()
+            s.detail(result=result)
+            return result
+
     def run_mvp(self) -> dict:
         """Hackathon MVP: jobs 1, 3, 4, 10."""
-        out = {"dualmic_merged": self.job_dualmic() if self.ingestor else 0}
-        out["duplicates_merged"] = self.job_dedup()
-        out["contradictions_closed"] = self.job_contradictions()
-        out["importance_updated"] = self.job_importance()
-        return out
+        with ensure_trace("consolidate", scope="mvp"):
+            out = {"dualmic_merged":
+                   self._run_job("job10_dualmic", self.job_dualmic)
+                   if self.ingestor else 0}
+            out["duplicates_merged"] = self._run_job("job1_dedup", self.job_dedup)
+            out["contradictions_closed"] = self._run_job(
+                "job3_contradictions", self.job_contradictions)
+            out["importance_updated"] = self._run_job(
+                "job4_importance", self.job_importance)
+            return out
 
     def run_full(self) -> dict:
         """The full Dream tier: MVP jobs + entity resolution, communities, the
         summary ladder, archival, graph repair, LLM relations, and OKF regen."""
-        out = self.run_mvp()
-        out["entities_resolved"] = self.job_entity_resolution()
-        out["communities"] = self.job_communities()
-        out["summaries"] = self.job_summaries()
-        out["archived"] = self.job_archival()
-        out["graph_repaired"] = self.job_graph_repair()
-        out["llm_relations"] = self.job_llm_relations()
-        out["okf"] = self.generate_okf()
-        return out
+        with ensure_trace("consolidate", scope="full"):
+            out = self.run_mvp()
+            out["entities_resolved"] = self._run_job(
+                "job2_entity_resolution", self.job_entity_resolution)
+            out["communities"] = self._run_job(
+                "job5_communities", self.job_communities)
+            out["summaries"] = self._run_job("job6_summaries", self.job_summaries)
+            out["reembedded"] = self._run_job("job7_reembed", self.job_reembed)
+            out["archived"] = self._run_job("job8_archival", self.job_archival)
+            out["graph_repaired"] = self._run_job(
+                "job9_graph_repair", self.job_graph_repair)
+            out["llm_relations"] = self._run_job(
+                "job_llm_relations", self.job_llm_relations)
+            out["okf"] = self._run_job("okf_generate", self.generate_okf)
+            return out

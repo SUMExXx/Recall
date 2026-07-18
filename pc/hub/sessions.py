@@ -19,6 +19,7 @@ class MeetingSession:
     utterances: list = field(default_factory=list)
     bookmarked: bool = False
     privacy_tag: str = "normal"
+    auto_title: bool = False   # no explicit title — derive one from the content
 
     def add_utterance(self, text: str, speaker: str = "", t_start: float | None = None,
                       t_end: float | None = None, asr_provider: str = "passthrough",
@@ -53,7 +54,8 @@ class SessionManager:
             meeting_id=meeting_id or f"mtg-{new_id()[:8]}",
             device_id=device_id, capture_device=capture_device,
             title=title or f"Meeting {time.strftime('%Y-%m-%d %H:%M')}",
-            started_at=time.time(), privacy_tag=privacy_tag)
+            started_at=time.time(), privacy_tag=privacy_tag,
+            auto_title=not title)
         self.active[device_id] = s
         return s
 
@@ -78,14 +80,32 @@ class SessionManager:
                 s.meeting_id, t_to - minutes * 60.0, t_to)
         return {"live_utterances": dropped_live, **persisted}
 
+    @staticmethod
+    def _title_from_content(utterances: list, fallback: str) -> str:
+        """First real utterance, trimmed — so the memory reads like its content
+        ("we decided to use JWT…"), not a generic capture label."""
+        for u in utterances:
+            text = (u.get("text") or "").strip()
+            if len(text) >= 8:
+                return text[:57] + "…" if len(text) > 60 else text
+        return fallback
+
     def end(self, device_id: str) -> str | None:
         """Close the session and ingest it as a meeting NMO. Returns memory_id."""
         s = self.active.pop(device_id, None)
         if s is None or not s.utterances:
             return None
+        title = (self._title_from_content(s.utterances, s.title)
+                 if s.auto_title else s.title)
+        # NMO.source must be one of the §3 device sources — a desktop capture
+        # is source="desktop", not the arduino default.
+        source = (s.capture_device if s.capture_device in
+                  ("mobile", "desktop", "arduino", "chrome_extension")
+                  else "desktop")
         memory_id = self.ingestor.ingest_meeting({
             "meeting_id": s.meeting_id,
-            "title": s.title,
+            "title": title,
+            "source": source,
             "capture_device": s.capture_device,
             "device_id": s.device_id,
             "start_time": s.started_at,

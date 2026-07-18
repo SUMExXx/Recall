@@ -95,16 +95,28 @@ def llm_extract_relation(sentence: str, llm=None) -> dict | None:
     if llm is None or not getattr(llm, "available", False):
         return None
     import json
-    try:
-        out = llm.generate(
-            "Extract exactly one (subject, predicate, object) triple from the "
-            'sentence as JSON: {"subject":"","predicate":"","object":""}. '
-            f"Sentence: {sentence}", json=True, timeout=60)
-        d = json.loads(out)
-    except Exception:
-        return None
-    if d.get("subject") and d.get("object"):
-        return {"subject": d["subject"],
-                "predicate": d.get("predicate", "related_to"),
-                "object": d["object"]}
-    return None
+
+    from .llm_validate import is_valid_relation
+    from .tracing import step
+    prompt = ("Extract exactly one (subject, predicate, object) triple from the "
+             'sentence as JSON: {"subject":"","predicate":"","object":""}. '
+             f"Sentence: {sentence}")
+    with step("extract_relation:llm_fallback",
+             model=getattr(llm, "model", llm.name)) as s:
+        s.detail(prompt=prompt)
+        try:
+            out = llm.generate(prompt, json=True, timeout=60)
+            s.detail(response=out)
+            d = json.loads(out)
+        except Exception as e:
+            s.detail(error=str(e))
+            return None
+        if not d.get("subject") or not d.get("object"):
+            return None
+        if not is_valid_relation(d["subject"], d["object"], sentence):
+            s.detail(rejected="object shares no vocabulary with the source "
+                             "sentence — likely hallucinated")
+            return None
+    return {"subject": d["subject"],
+            "predicate": d.get("predicate", "related_to"),
+            "object": d["object"]}

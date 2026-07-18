@@ -7,9 +7,10 @@ WS protocol (JSON text messages, plus binary audio):
                   heartbeat{} | subscribe{topics[]}
                   meeting_start{meeting_id?, title?, capture_device?}
                   utterance{text, speaker?, t_start?, t_end?, asr_confidence?}
-                  <binary frame>  raw PCM16 mono 16 kHz audio; buffered and
-                                  transcribed via the ASR worker, then treated
-                                  as an utterance
+                  <binary frame>  raw PCM16 mono 16 kHz audio; buffered ~4 s,
+                                  transcribed via the ASR worker (in-process
+                                  faster-whisper by default), then treated as
+                                  an utterance
                   button{action: bookmark|forget_last, minutes?}
                   meeting_end{} | ask{query, request_id?}
   hub -> client : welcome{resume_token, seq, missed[]} | pong
@@ -27,6 +28,7 @@ import asyncio
 import io
 import itertools
 import json
+import logging
 import os
 import threading
 import time
@@ -47,20 +49,22 @@ from recall_memory.consolidate import Consolidator
 from recall_memory.ingest import Ingestor
 from recall_memory.retrieval import Retriever
 from recall_memory.store import MemoryStore
+from recall_memory.tracing import ensure_trace, step
 
 from .asr import (HinglishLocalProvider, PassthroughProvider,
-                  SarvamCloudProvider, make_local_whisper,
-                  transcribe_with_fallback)
+                  SarvamCloudProvider, make_local_whisper)
 from .metrics import Metrics
 from .policy import PolicyEngine
 from .proactive import ProactiveRecallEngine
 from .registry import DeviceRegistry
 from .sessions import SessionManager
 
+log = logging.getLogger("recall.hub")
+
 EVENT_BUFFER = 500
 LED_STATES = ("idle", "capturing", "searching", "recalled", "muted", "error")
 SAMPLE_RATE = 16000
-AUDIO_FLUSH_SECONDS = 6.0        # transcribe in ~6 s windows
+AUDIO_FLUSH_SECONDS = 4.0        # transcribe in ~4 s windows
 _AUDIO_FLUSH_BYTES = int(SAMPLE_RATE * 2 * AUDIO_FLUSH_SECONDS)
 
 
@@ -97,7 +101,8 @@ class PlanInfo(BaseModel):
 
 class SourceItem(BaseModel):
     citation: str
-    title: str = ""
+    title: str = ""          # parent memory's title
+    chunk_title: str = ""    # this hit's own extractive title
     memory_id: str = ""
     source_type: str = ""
     snippet: str = ""
@@ -118,6 +123,7 @@ class SearchItem(BaseModel):
     score: float
     source_type: str
     title: str
+    chunk_title: str = ""
     snippet: str
 
 
@@ -157,7 +163,7 @@ class HubState:
         self.retriever = Retriever(self.store, cfg, self.backend)
         self.consolidator = Consolidator(self.store, cfg, self.ingestor)
         self.registry = DeviceRegistry()
-        self.policy = PolicyEngine()
+        self.policy = PolicyEngine(cloud_optin=cfg.cloud_optin)
         self.metrics = Metrics()
         self.sessions = SessionManager(self.ingestor, self.store)
         self.proactive = ProactiveRecallEngine(self.retriever)
@@ -165,7 +171,10 @@ class HubState:
             "passthrough": PassthroughProvider(),
             "whisper_local": make_local_whisper(cfg),   # in-process or HTTP
             "hinglish_local": HinglishLocalProvider(cfg.hinglish_url),
-            "sarvam_cloud": SarvamCloudProvider(),
+            "sarvam_cloud": SarvamCloudProvider(
+                api_key=cfg.sarvam_api_key, model=cfg.sarvam_model,
+                language_code=cfg.sarvam_language_code, mode=cfg.sarvam_mode,
+                timeout=cfg.sarvam_timeout_s, endpoint=cfg.sarvam_endpoint),
         }
         # WS fabric — keyed per CONNECTION, not per device_id: two tabs may
         # both hello as "dashboard", and a reconnect must not steal the event
@@ -178,6 +187,9 @@ class HubState:
         self.audio_buffers: dict[str, bytearray] = {}    # device_id -> pcm16
         self.led_state = "idle"
         self.health = {"llm": None, "db": True, "checked_at": 0.0}
+        # Dream-tier scheduling: consolidate when idle, only if data changed.
+        self._last_dream = time.time()
+        self._dream_stats: dict | None = None
 
     # ------------------------------------------------------------ events
 
@@ -234,13 +246,16 @@ class HubState:
                                t_end=t_end, asr_provider=asr_provider,
                                asr_confidence=asr_confidence, lang=lang)
         self.metrics.incr("utterances")
+        log.info("utterance [%s] %s%r (conf %.2f, %d buffered)",
+                 sess.meeting_id, f"{speaker}: " if speaker else "",
+                 text[:80], asr_confidence, len(sess.utterances))
         await self.broadcast("transcript", {
             "meeting_id": sess.meeting_id, "speaker": u["speaker"],
             "text": u["text"], "t_start": u["t_start"],
             "asr_provider": asr_provider})
 
         def _observe():
-            with self.lock, self.metrics.timer("proactive"):
+            with self.metrics.timer("proactive"):
                 return self.proactive.observe(
                     text, exclude_meeting_id=sess.meeting_id)
         recall = await anyio.to_thread.run_sync(_observe)
@@ -252,28 +267,66 @@ class HubState:
             await asyncio.sleep(0)
             await self.set_led("capturing")
 
-    async def flush_audio(self, device_id: str, min_bytes: int = 1):
-        """Transcribe the device's buffered PCM16 audio via the ASR workers."""
+    async def flush_audio(self, device_id: str, min_bytes: int = 1,
+                         privacy_tag: str | None = None):
+        """Transcribe the device's buffered PCM16 audio via the ASR workers.
+
+        Selection (plan §2): local Whisper runs first — it's fast, free, and
+        already performs language ID as part of transcription, so there's no
+        need for a separate detection pass. If the DETECTED language is Indic
+        and the user has opted into cloud AND this content's privacy tag
+        allows it, prefer Sarvam's transcription for that segment (bounded by
+        `sarvam_timeout_s`; any failure keeps the local result). Falls to
+        HinglishLocal instead when cloud isn't allowed.
+        """
         buf = self.audio_buffers.get(device_id)
         if not buf or len(buf) < min_bytes:
             return
         pcm = bytes(buf)
         buf.clear()
         wav = pcm16_to_wav(pcm)
-        providers = {k: self.asr_providers[k]
-                     for k in ("whisper_local", "hinglish_local")}
 
         def _asr():
-            with self.metrics.timer("asr"):
-                return transcribe_with_fallback(
-                    {"audio": wav}, "en", 0.99, self.policy, providers)
+            # Runs in a worker thread (anyio.to_thread below) — the trace file
+            # write happens off the event loop, same as everything else here.
+            with ensure_trace("asr_transcribe", device_id=device_id,
+                              audio_bytes=len(wav)), self.metrics.timer("asr"):
+                with step("asr:whisper_local"):
+                    local = self.asr_providers["whisper_local"].transcribe(
+                        {"audio": wav})
+                indic = local.lang in ("hi", "hi-en")
+                if not indic:
+                    return local
+                if self.policy.is_cloud_allowed(privacy_tag):
+                    with step("asr:sarvam_cloud", detected_lang=local.lang) as s:
+                        try:
+                            cloud = self.asr_providers["sarvam_cloud"].transcribe(
+                                {"audio": wav})
+                            s.detail(used=True)
+                            return cloud
+                        except Exception as e:
+                            s.detail(used=False, error=str(e))
+                with step("asr:hinglish_local", detected_lang=local.lang) as s:
+                    try:
+                        hin = self.asr_providers["hinglish_local"].transcribe(
+                            {"audio": wav})
+                        s.detail(used=True)
+                        return hin
+                    except Exception as e:
+                        s.detail(used=False, error=str(e))
+                return local   # every Indic path failed — keep the local result
+        t0 = time.perf_counter()
         try:
             res = await anyio.to_thread.run_sync(_asr)
         except Exception as e:
+            log.warning("ASR failed for %s: %s", device_id, e)
             await self.broadcast("transcript", {
                 "meeting_id": "", "speaker": "", "text": "",
                 "error": f"ASR unavailable: {e}"})
             return
+        log.info("asr %s: %.1fs audio -> %r in %.0f ms (conf %.2f)",
+                 device_id, len(pcm) / (SAMPLE_RATE * 2), res.text[:60],
+                 (time.perf_counter() - t0) * 1000, res.confidence)
         if res.text.strip():
             await self.handle_utterance(
                 device_id, res.text.strip(), asr_provider="whisper_local",
@@ -287,7 +340,7 @@ class HubState:
         t0 = time.perf_counter()
         try:
             def _ask():
-                with self.lock, self.metrics.timer("ask_total"):
+                with self.metrics.timer("ask_total"):
                     return self.retriever.ask(query, top_k=k)
             out = await anyio.to_thread.run_sync(_ask)
             plan = out["plan"]
@@ -299,14 +352,19 @@ class HubState:
                          "path": plan.path, "weight_profile": plan.weight_profile,
                          "filters": plan.filters},
                 "sources": [{"citation": c.citation(), "title": c.title,
+                             "chunk_title": c.chunk_title,
                              "memory_id": c.memory_id,
                              "source_type": c.source_type,
                              "snippet": c.text[:200], "score": round(c.score, 3)}
                             for c in out.get("contexts", [])],
             }
+            log.info("ask %r -> tier %d/%s, %d sources, %d ms", query[:60],
+                     plan.tier, plan.query_type, len(payload["sources"]),
+                     payload["latency_ms"])
             await self.set_led("recalled" if payload["sources"] else "idle")
             return payload
         except Exception as e:
+            log.exception("ask failed: %r", query[:60])
             await self.set_led("error")
             return {"error": str(e),
                     "latency_ms": round((time.perf_counter() - t0) * 1000)}
@@ -325,8 +383,9 @@ def get_state() -> HubState:
 # ------------------------------------------------------------- lifespan
 
 async def supervisor_loop():
-    """Health probes + lease sweeps (§4 REL). Workers here are in-process /
-    HTTP services, so 'restart' means re-probing and surfacing state."""
+    """Health probes + lease sweeps (§4 REL) + the Dream-tier scheduler:
+    consolidation runs every cfg.consolidate_every_s while idle, and ONLY when
+    the store changed since the last run — never inline with capture."""
     s = get_state()
     while True:
         try:
@@ -336,26 +395,96 @@ async def supervisor_loop():
                 except Exception:
                     return False
             s.health["llm"] = await anyio.to_thread.run_sync(_probe)
-            with s.lock:
+            with s.store.lock:
                 s.health["db"] = bool(s.store.db.execute("SELECT 1").fetchone())
             s.health["checked_at"] = time.time()
             expired = s.registry.sweep()
             if expired:
+                log.info("device leases expired: %s", expired)
                 await s.broadcast("device_health",
                                   {"devices": s.registry.snapshot()})
+            await maybe_dream(s)
         except Exception:
-            pass
+            log.exception("supervisor iteration failed")
         await asyncio.sleep(15)
+
+
+async def maybe_dream(s: HubState):
+    """Run the consolidation agent if due and the data changed."""
+    every = s.cfg.consolidate_every_s
+    if not every or time.time() - s._last_dream < every:
+        return
+    if s.sessions.active:            # someone is mid-capture — stay out of the way
+        return
+    snap = s.store.stats()
+    s._last_dream = time.time()
+    if snap == s._dream_stats:
+        return                       # nothing new since the last dream pass
+    def _dream():
+        # ensure_trace here (not around the outer async fn) keeps the trace
+        # file write in this worker thread, off the event loop. run_full()'s
+        # own ensure_trace("consolidate") attaches to this same trace, so one
+        # block shows every Dream-tier job's timing together.
+        with ensure_trace("dream_tier"), s.metrics.timer("consolidate"):
+            return s.consolidator.run_full()
+    t0 = time.perf_counter()
+    out = await anyio.to_thread.run_sync(_dream)
+    s._dream_stats = s.store.stats()
+    log.info("dream tier ran in %.0f ms: %s",
+             (time.perf_counter() - t0) * 1000, out)
+    await s.broadcast("consolidated", out)
+
+
+async def warmup():
+    """Pre-load the hot path so the FIRST ask isn't seconds of cold start:
+    embedder graph, tier-2 router prototypes, and the LLM weights."""
+    s = get_state()
+
+    def _warm() -> dict:
+        report: dict = {}
+        with ensure_trace("warmup"):
+            with step("warmup:embed_query") as st:
+                try:
+                    t0 = time.perf_counter()
+                    s.retriever.embedder.embed_query("warmup")
+                    report["embed_ms"] = round((time.perf_counter() - t0) * 1000)
+                    st.detail(ms=report["embed_ms"])
+                    t0 = time.perf_counter()
+                    s.retriever.router._prototypes()
+                    report["prototypes_ms"] = round((time.perf_counter() - t0) * 1000)
+                    st.detail(prototypes_ms=report["prototypes_ms"])
+                except Exception as e:
+                    report["embed"] = f"unavailable: {e}"
+                    st.detail(error=str(e))
+            with step("warmup:llm_ping") as st:
+                try:
+                    if s.backend.llm.available:
+                        t0 = time.perf_counter()
+                        s.backend.llm.generate("Reply with exactly: OK", timeout=120)
+                        report["llm_ms"] = round((time.perf_counter() - t0) * 1000)
+                        st.detail(ms=report["llm_ms"])
+                    else:
+                        report["llm"] = "unavailable"
+                        st.detail(available=False)
+                except Exception as e:
+                    report["llm"] = f"unavailable: {e}"
+                    st.detail(error=str(e))
+        return report
+
+    log.info("warmup: %s", await anyio.to_thread.run_sync(_warm))
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     get_state()
-    task = asyncio.get_event_loop().create_task(supervisor_loop())
+    loop = asyncio.get_event_loop()
+    tasks = [loop.create_task(supervisor_loop()),
+             loop.create_task(warmup())]
     try:
         yield
     finally:
-        task.cancel()
+        for t in tasks:
+            t.cancel()
 
 
 app = FastAPI(title="Recall PC Hub", version="2.0", lifespan=lifespan)
@@ -412,27 +541,27 @@ async def search_ep(body: SearchRequest):
     s = get_state()
 
     def _search():
-        with s.lock, s.metrics.timer("search_total"):
+        with s.metrics.timer("search_total"):
             return s.retriever.retrieve(body.query, top_k=body.k)
     ctxs = await anyio.to_thread.run_sync(_search)
     return [SearchItem(citation=c.citation(), score=round(c.score, 3),
                        source_type=c.source_type, title=c.title,
+                       chunk_title=c.chunk_title,
                        snippet=c.text[:200]) for c in ctxs]
 
 
 @app.post("/forget")
 async def forget_ep(body: ForgetRequest):
     s = get_state()
-    with s.lock:
-        if body.memory_id:
-            out = s.store.forget_memory(body.memory_id)
-        elif body.meeting_id and body.last_minutes:
-            t_to = time.time()
-            out = s.store.forget_time_range(
-                body.meeting_id, t_to - float(body.last_minutes) * 60, t_to)
-        else:
-            raise HTTPException(status_code=400,
-                                detail="need memory_id or meeting_id+last_minutes")
+    if body.memory_id:
+        out = s.store.forget_memory(body.memory_id)
+    elif body.meeting_id and body.last_minutes:
+        t_to = time.time()
+        out = s.store.forget_time_range(
+            body.meeting_id, t_to - float(body.last_minutes) * 60, t_to)
+    else:
+        raise HTTPException(status_code=400,
+                            detail="need memory_id or meeting_id+last_minutes")
     s.metrics.incr("forgets")
     await s.broadcast("memory_deleted", {"memory_id": body.memory_id, **out})
     return out
@@ -443,7 +572,7 @@ async def consolidate_ep():
     s = get_state()
 
     def _run():
-        with s.lock, s.metrics.timer("consolidate"):
+        with s.metrics.timer("consolidate"):
             return s.consolidator.run_mvp()
     return await anyio.to_thread.run_sync(_run)
 
@@ -451,7 +580,7 @@ async def consolidate_ep():
 @app.get("/dump")
 async def dump_ep():
     s = get_state()
-    with s.lock:
+    with s.store.lock:
         rows = s.store.db.execute(
             """SELECT memory_id, source_type, title, created_at, importance,
                       archived FROM memories ORDER BY created_at DESC""").fetchall()
@@ -459,30 +588,72 @@ async def dump_ep():
 
 
 @app.get("/links")
-async def links_ep(threshold: float = Query(0.6)):
-    """Similarity edges between memories — feeds the dashboard constellation.
-    Memory vector = mean of its chunks' full embeddings."""
+async def links_ep(threshold: float = Query(0.55)):
+    """Correlation edges between memories — feeds the dashboard constellation.
+
+    score = 0.6 * embedding cosine (mean chunk vector) + 0.4 * shared-entity
+    overlap, and each edge carries `why` (the entities both memories mention)
+    so a line is explainable, not vague."""
     s = get_state()
-    with s.lock:
+    with s.store.lock:
         rows = s.store.db.execute(
             """SELECT c.memory_id, c.emb_full FROM chunks c
                JOIN memories m ON m.memory_id = c.memory_id
                WHERE m.archived = 0""").fetchall()
+        ent_rows = s.store.db.execute(
+            """SELECT DISTINCT em.memory_id, em.entity_id, em.entity_text
+               FROM entity_mentions em JOIN memories m
+                 ON m.memory_id = em.memory_id WHERE m.archived = 0""").fetchall()
     by_mem: dict[str, list] = {}
     for r in rows:
         by_mem.setdefault(r["memory_id"], []).append(
             np.frombuffer(r["emb_full"], dtype=np.float32))
+    ents: dict[str, set] = {}
+    ent_text: dict[str, str] = {}
+    for r in ent_rows:
+        ents.setdefault(r["memory_id"], set()).add(r["entity_id"])
+        ent_text.setdefault(r["entity_id"], r["entity_text"])
     ids = list(by_mem)
     if len(ids) < 2:
         return []
     mat = np.stack([np.mean(by_mem[i], axis=0) for i in ids])
     mat = mat / (np.linalg.norm(mat, axis=1, keepdims=True) + 1e-9)
     sim = mat @ mat.T
-    edges = [{"a": ids[i], "b": ids[j], "score": round(float(sim[i, j]), 3)}
-             for i in range(len(ids)) for j in range(i + 1, len(ids))
-             if sim[i, j] >= threshold]
+    edges = []
+    for i in range(len(ids)):
+        for j in range(i + 1, len(ids)):
+            a, b = ids[i], ids[j]
+            shared = ents.get(a, set()) & ents.get(b, set())
+            overlap = (len(shared) / min(len(ents.get(a, set())) or 1,
+                                         len(ents.get(b, set())) or 1)
+                       if shared else 0.0)
+            score = 0.6 * float(sim[i, j]) + 0.4 * min(1.0, overlap)
+            if score >= threshold:
+                why = sorted((ent_text[e] for e in shared),
+                             key=str.lower)[:3]
+                edges.append({"a": a, "b": b, "score": round(score, 3),
+                              "why": why})
     edges.sort(key=lambda e: -e["score"])
     return edges[:200]
+
+
+@app.get("/communities")
+async def communities_ep():
+    """Dream-tier memory groups (§12 job 5) — clusters of memories that share
+    entities, labelled by the entity they share most."""
+    s = get_state()
+    with s.store.lock:
+        rows = s.store.db.execute(
+            "SELECT community_id, label, member_ids FROM communities").fetchall()
+        out = []
+        for r in rows:
+            label_row = s.store.db.execute(
+                "SELECT entity_text FROM entity_mentions WHERE entity_id=? LIMIT 1",
+                (r["label"],)).fetchone()
+            out.append({"community_id": r["community_id"],
+                        "label": label_row["entity_text"] if label_row else r["label"],
+                        "members": json.loads(r["member_ids"])})
+    return out
 
 
 @app.post("/digest")
@@ -491,7 +662,7 @@ async def digest_ep():
     s = get_state()
     t0 = time.perf_counter()
     day_start = time.mktime(time.localtime()[:3] + (0, 0, 0, 0, 0, -1))
-    with s.lock:
+    with s.store.lock:
         rows = s.store.db.execute(
             """SELECT title, summary, source_type FROM memories
                WHERE archived=0 AND created_at >= ? ORDER BY created_at""",
@@ -555,6 +726,8 @@ async def ws_endpoint(ws: WebSocket):
                 dev, resumed = s.registry.hello(
                     device_id, msg.get("role", "other"), msg.get("resume_token"))
                 s.sockets[conn_id] = {"device_id": device_id, "ws": ws}
+                log.info("ws hello %s (role=%s, resumed=%s)",
+                         device_id, msg.get("role", "other"), resumed)
                 missed = []
                 if resumed and msg.get("last_seq"):
                     missed = [e for e in s.events
@@ -584,6 +757,8 @@ async def ws_endpoint(ws: WebSocket):
                     msg.get("privacy_tag", "normal"))
                 s.proactive.reset()
                 s.audio_buffers[device_id] = bytearray()
+                log.info("meeting_start [%s] device=%s capture=%s",
+                         sess.meeting_id, device_id, sess.capture_device)
                 await s.set_led("capturing")
                 await ws.send_text(json.dumps(
                     {"type": "meeting_started", "meeting_id": sess.meeting_id}))
@@ -603,8 +778,7 @@ async def ws_endpoint(ws: WebSocket):
                         {"type": "ack", "action": "bookmark", "ok": ok}))
                 elif action == "forget_last":
                     minutes = float(msg.get("minutes", 5))
-                    with s.lock:
-                        out = s.sessions.forget_last(device_id, minutes)
+                    out = s.sessions.forget_last(device_id, minutes)
                     s.metrics.incr("forgets")
                     await ws.send_text(json.dumps(
                         {"type": "ack", "action": "forget_last", **out}))
@@ -613,9 +787,11 @@ async def ws_endpoint(ws: WebSocket):
                 await s.flush_audio(device_id)
 
                 def _end():
-                    with s.lock, s.metrics.timer("ingest_meeting"):
+                    with s.metrics.timer("ingest_meeting"):
                         return s.sessions.end(device_id)
                 memory_id = await anyio.to_thread.run_sync(_end)
+                log.info("meeting_end device=%s -> memory %s", device_id,
+                         memory_id or "(no utterances — nothing ingested)")
                 await s.set_led("idle")
                 await ws.send_text(json.dumps(
                     {"type": "meeting_ended", "memory_id": memory_id}))

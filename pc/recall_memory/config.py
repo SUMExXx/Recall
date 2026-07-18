@@ -14,6 +14,8 @@ The domain constants below (dimensions, chunk specs, RRF weight profiles) are
 fixed by plans/memory_engineering_v2.md and are NOT environment config.
 """
 from __future__ import annotations
+from dotenv import load_dotenv
+load_dotenv()
 
 from dataclasses import dataclass
 from typing import Literal
@@ -22,7 +24,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 PROCESSING_VERSION = "v2.0"
 
-DIM_FULL = 768     # Nomic-Embed-Text v1.5 output
+import os
+DIM_FULL = int(os.environ.get("RECALL_EMBEDDING_DIM", "768"))
 DIM_COARSE = 256   # Matryoshka truncation for the hot int8 scan
 
 Backend = Literal["npu", "ollama", "hash"]
@@ -91,9 +94,21 @@ class RecallConfig(BaseSettings):
     backend: Backend = "npu"
 
     db_path: str = "recall.db"
+    log_level: str = "INFO"              # RECALL_LOG_LEVEL: DEBUG for stage detail
+
+    # Per-request step trace (chunking/embedding/retrieval/rerank/planner/LLM
+    # prompt+response/background jobs) written as one readable block per
+    # operation — see recall_memory/tracing.py. Off disables the file write;
+    # steps are still visible via the `logging` module at DEBUG.
+    trace_enabled: bool = True
+    trace_file: str = "logs/recall_trace.log"
+
+    # Dream tier cadence: the hub runs the consolidation agent this often when
+    # idle (never inline with capture). 0 disables the automatic runs.
+    consolidate_every_s: float = 120.0
 
     # --- router / retrieval / consolidation knobs ------------------------
-    use_tier3_planner: bool = False          # off by default (plan rec. #3)
+    use_tier3_planner: bool = True          # off by default (plan rec. #3)
     near_dup_cosine: float = 0.95
     dualmic_fuzzy_threshold: float = 0.85
 
@@ -122,3 +137,26 @@ class RecallConfig(BaseSettings):
     whisper_model: str = "base.en"                 # faster-whisper model (in-process)
     whisper_url: str = "http://localhost:8080"     # http mode: whisper.cpp contract
     hinglish_url: str = "http://localhost:8081"    # Oriserve Hinglish BYOM slot
+    # Decoding knobs (faster-whisper). beam_size was hardcoded to 1 (greedy)
+    # for latency, which is the direct cause of a lot of mangled domain-term
+    # transcription — 5 is the faster-whisper library default and materially
+    # more accurate at a modest CPU cost.
+    whisper_beam_size: int = 5
+    # Vocabulary bias for domain jargon Whisper otherwise mangles (e.g.
+    # "FAISS", "bi-temporal", "Matryoshka", "OKF", "RRF") — passed as
+    # initial_prompt. Empty by default; set per deployment.
+    whisper_initial_prompt: str = ""
+
+    # --- Sarvam (cloud ASR, policy-gated opt-in — plan §2) ------------------
+    # NEVER called unless PolicyEngine.is_cloud_allowed() says so. Contract:
+    # docs.sarvam.ai/api-reference/speech-to-text/transcribe (POST
+    # https://api.sarvam.ai/speech-to-text, multipart/form-data, header
+    # api-subscription-key). Get a key at https://dashboard.sarvam.ai.
+    sarvam_api_key: str = "sk_kobw09xo_JqDdUSFxsT6AmRQIV38qQglc"
+    sarvam_endpoint: str = "https://api.sarvam.ai/speech-to-text"
+    sarvam_model: str = "saaras:v3"          # saaras:v3 (recommended) | saarika:v2.5
+    sarvam_language_code: str = "unknown"    # BCP-47, or "unknown" to auto-detect
+    sarvam_mode: str = "transcribe"          # transcribe|translate|verbatim|translit|codemix
+    sarvam_timeout_s: float = 3.0            # plan §2: 3s timeout -> local fallback
+    cloud_optin: bool = False
+

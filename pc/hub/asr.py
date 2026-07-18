@@ -15,9 +15,29 @@ Providers:
 from __future__ import annotations
 
 import io
+import logging
 import math
 import wave
 from dataclasses import dataclass, field
+
+from recall_memory.tracing import step
+
+log = logging.getLogger("recall.asr")
+
+
+def _collapse_hallucination_loop(text: str, min_repeats: int = 4) -> str:
+    """Detect Whisper's local infinite-repetition loops on silence / noise
+    ("Yeah. Yeah. Yeah. ...") and collapse them to a single word. Returns text."""
+    import re
+    for span in (1, 2, 3):
+        if span == 1:
+            pattern = r"\b(\w+)([.,!?…]*\s+\1){" + str(min_repeats - 1) + r",}"
+        elif span == 2:
+            pattern = r"\b(\w+[.,!?…]*\s+\w+)([.,!?…]*\s+\1){" + str(min_repeats - 1) + r",}"
+        else:
+            pattern = r"\b(\w+[.,!?…]*\s+\w+[.,!?…]*\s+\w+)([.,!?…]*\s+\1){" + str(min_repeats - 1) + r",}"
+        text = re.sub(pattern, r"\1", text, flags=re.IGNORECASE)
+    return text.strip()
 
 
 @dataclass
@@ -51,15 +71,26 @@ class FasterWhisperProvider:
 
     name = "whisper_local"
 
-    def __init__(self, model_name: str = "base.en"):
+    def __init__(self, model_name: str = "base.en", beam_size: int = 5,
+                initial_prompt: str = ""):
         self.model_name = model_name
+        # beam_size was hardcoded to 1 (greedy) here — the single biggest
+        # cause of mangled domain-term transcription ("FDS5 keyword index"
+        # for "FAISS keyword index", etc.); 5 is faster-whisper's own
+        # library default and materially more accurate for modest CPU cost.
+        self.beam_size = beam_size
+        # Vocabulary bias for jargon Whisper otherwise guesses phonetically.
+        self.initial_prompt = initial_prompt or None
         self._model = None
 
     def _load(self):
         if self._model is None:
             from faster_whisper import WhisperModel
+            log.info("loading whisper model %s (downloads to the HF cache on "
+                     "first use)…", self.model_name)
             self._model = WhisperModel(self.model_name, device="cpu",
                                        compute_type="int8")
+            log.info("whisper model %s ready", self.model_name)
         return self._model
 
     def transcribe(self, payload: dict) -> ASRResult:
@@ -69,8 +100,18 @@ class FasterWhisperProvider:
             pcm = w.readframes(w.getnframes())
         audio = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
         lang = "en" if self.model_name.endswith(".en") else None
-        segs_iter, info = self._load().transcribe(audio, beam_size=1,
-                                                  language=lang)
+        segs_iter, info = self._load().transcribe(
+            audio, beam_size=self.beam_size, language=lang,
+            initial_prompt=self.initial_prompt,
+            # vad_filter: skip non-speech — without it Whisper hallucinates
+            # text ("Thanks for watching") on silent windows, becoming junk
+            # memories. condition_on_previous_text=False: don't feed prior
+            # segments back as decoding context — that feedback loop is what
+            # produces "Yeah. Yeah. Yeah. ..." repetition runs on noisy audio.
+            # no_repeat_ngram_size: hard decoding-level ban on repeating the
+            # same 3-gram, a second independent guard against the same loop.
+            vad_filter=True, condition_on_previous_text=False,
+            no_repeat_ngram_size=3)
         segments, texts, logprobs = [], [], []
         for s in segs_iter:
             segments.append({"t_start": s.start, "t_end": s.end, "text": s.text})
@@ -79,8 +120,8 @@ class FasterWhisperProvider:
                 logprobs.append(s.avg_logprob)
         conf = (min(1.0, math.exp(sum(logprobs) / len(logprobs)))
                 if logprobs else 0.9)
-        return ASRResult(text="".join(texts).strip(),
-                         lang=getattr(info, "language", "en") or "en",
+        text = _collapse_hallucination_loop("".join(texts).strip())
+        return ASRResult(text=text, lang=getattr(info, "language", "en") or "en",
                          segments=segments, confidence=conf)
 
     def capabilities(self) -> dict:
@@ -133,16 +174,62 @@ class HinglishLocalProvider(WhisperLocalProvider):
 
 
 class SarvamCloudProvider:
-    """Opt-in cloud ASR. Deliberately unimplemented on the dev laptop: the
-    selection policy treats any exception as a timeout and falls back locally."""
+    """Sarvam Saaras v3 — policy-gated opt-in cloud ASR (plan §2). NEVER
+    invoked unless PolicyEngine.is_cloud_allowed() says so; `flush_audio` in
+    hub/app.py only reaches for this after local Whisper's own language ID
+    detects Indic audio, and wraps the call with a short timeout that falls
+    back to HinglishLocal/WhisperLocal on any failure.
+
+    REST contract (docs.sarvam.ai/api-reference/speech-to-text/transcribe):
+      POST {endpoint}, multipart/form-data, header `api-subscription-key`,
+      fields file/model/language_code/mode. Response JSON has `transcript`,
+      `language_code`, `language_probability`, optional `timestamps`.
+    """
     name = "sarvam_cloud"
 
+    def __init__(self, api_key: str = "", model: str = "saaras:v3",
+                language_code: str = "unknown", mode: str = "transcribe",
+                timeout: float = 3.0,
+                endpoint: str = "https://api.sarvam.ai/speech-to-text"):
+        self.api_key = api_key
+        self.model = model
+        self.language_code = language_code
+        self.mode = mode
+        self.timeout = timeout
+        self.endpoint = endpoint
+
     def transcribe(self, payload: dict) -> ASRResult:
-        raise RuntimeError("Sarvam cloud provider not wired on dev machine")
+        if not self.api_key:
+            raise RuntimeError("sarvam_cloud has no RECALL_SARVAM_API_KEY configured")
+        import requests
+        with step("asr:sarvam_http_call", model=self.model,
+                  language_code=self.language_code) as s:
+            r = requests.post(
+                self.endpoint,
+                headers={"api-subscription-key": self.api_key},
+                files={"file": ("audio.wav", payload["audio"], "audio/wav")},
+                data={"model": self.model, "language_code": self.language_code,
+                      "mode": self.mode},
+                timeout=self.timeout)
+            r.raise_for_status()
+            data = r.json()
+            s.detail(response_language=data.get("language_code"),
+                     transcript=data.get("transcript"))
+        ts = data.get("timestamps") or {}
+        words = ts.get("words") or []
+        starts = ts.get("start_time_seconds") or []
+        ends = ts.get("end_time_seconds") or []
+        segments = [{"t_start": st, "t_end": en, "text": w}
+                    for w, st, en in zip(words, starts, ends)]
+        return ASRResult(
+            text=(data.get("transcript") or "").strip(),
+            lang=data.get("language_code") or self.language_code,
+            segments=segments,
+            confidence=float(data.get("language_probability") or 0.85))
 
     def capabilities(self) -> dict:
         return {"langs": ["hi", "en", "+21 indic"], "word_ts": True,
-                "diarization": False, "offline": False, "codemix": True}
+                "diarization": True, "offline": False, "codemix": True}
 
 
 def make_local_whisper(cfg):
@@ -157,7 +244,9 @@ def make_local_whisper(cfg):
     if mode in ("auto", "embedded"):
         try:
             import faster_whisper  # noqa: F401 — availability probe only
-            return FasterWhisperProvider(cfg.whisper_model)
+            return FasterWhisperProvider(
+                cfg.whisper_model, beam_size=getattr(cfg, "whisper_beam_size", 5),
+                initial_prompt=getattr(cfg, "whisper_initial_prompt", ""))
         except ImportError:
             if mode == "embedded":
                 raise RuntimeError(
@@ -191,10 +280,13 @@ def transcribe_with_fallback(payload: dict, lang: str, lang_prob: float,
             order.append(p)
     last_err = None
     for provider in order:
-        try:
-            res = provider.transcribe(payload)
-            res.segments = res.segments or []
-            return res
-        except Exception as e:  # timeout / unreachable -> next in chain
-            last_err = e
+        with step(f"asr:try_{provider.name}") as s:
+            try:
+                res = provider.transcribe(payload)
+                res.segments = res.segments or []
+                s.detail(ok=True, text=res.text[:200], confidence=res.confidence)
+                return res
+            except Exception as e:   # timeout / unreachable -> next in chain
+                s.detail(ok=False, error=str(e))
+                last_err = e
     raise RuntimeError(f"all ASR providers failed: {last_err}")

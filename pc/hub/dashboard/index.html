@@ -169,6 +169,25 @@ function refreshLinks() {
   }, 400);
 }
 
+// Dream-tier communities: memory_id -> {gi, label}. Dots in the same group
+// share a color and sit together in the spiral.
+const GROUP_COLORS = ['rgba(240,160,48,0.85)', 'rgba(122,167,247,0.85)',
+                      'rgba(87,200,123,0.85)', 'rgba(232,131,124,0.85)',
+                      'rgba(200,160,255,0.85)', 'rgba(120,210,210,0.85)'];
+let groups = {};
+async function loadCommunities() {
+  try {
+    const cs = await (await fetch('/communities')).json();
+    groups = {};
+    cs.forEach((c, gi) =>
+      c.members.forEach(id => { groups[id] = {gi, label: c.label}; }));
+    for (const n of nodes) n.group = groups[n.id] || null;
+    // groups contiguous in the spiral => visually clustered
+    nodes.sort((a, b) => ((a.group ? a.group.gi : 99) -
+                          (b.group ? b.group.gi : 99)) || (a.ts - b.ts));
+  } catch (e) {}
+}
+
 function layoutPos(i, count, w, h) {
   const cx = w / 2, cy = h / 2;
   const maxR = Math.min(w, h) / 2 - 14;
@@ -180,7 +199,7 @@ function layoutPos(i, count, w, h) {
 
 function addNode(m, flash) {
   if (nodes.some(n => n.id === m.id)) return;
-  nodes.push({id: m.id, text: m.text, ts: m.ts,
+  nodes.push({id: m.id, text: m.text, ts: m.ts, group: groups[m.id] || null,
               flash: flash ? {r: 240, g: 160, b: 48, a: 1} : null});
   memCount.textContent = nodes.length;
 }
@@ -249,7 +268,8 @@ function draw() {
     }
     ctx.beginPath();
     ctx.arc(n.x, n.y, 4, 0, Math.PI * 2);
-    ctx.fillStyle = 'rgba(163,155,138,0.5)';
+    ctx.fillStyle = n.group ? GROUP_COLORS[n.group.gi % GROUP_COLORS.length]
+                            : 'rgba(163,155,138,0.5)';
     ctx.fill();
     if (n.flash && n.flash.a > 0.02) {
       const f = n.flash;
@@ -278,10 +298,15 @@ canvas.addEventListener('click', (ev) => {
   }
   selectedId = best ? best.id : null;
   if (best) {
-    const related = edges.filter(e => e.a === best.id || e.b === best.id).length;
+    const rel = edges.filter(e => e.a === best.id || e.b === best.id)
+                     .sort((a, b) => b.score - a.score);
+    const why = rel.length && rel[0].why && rel[0].why.length
+      ? ` (shared: ${rel[0].why.map(esc).join(', ')})` : '';
     vizCaption.innerHTML =
       `"${esc(best.text)}" — ${new Date(best.ts * 1000).toLocaleString()}` +
-      (related ? ` · linked to ${related} memor${related === 1 ? 'y' : 'ies'}` : '') +
+      (best.group ? ` · group “${esc(best.group.label)}”` : '') +
+      (rel.length ? ` · linked to ${rel.length} memor` +
+                    `${rel.length === 1 ? 'y' : 'ies'}${why}` : '') +
       ` <button class="del-btn" id="del-mem">forget this</button>`;
     document.getElementById('del-mem').onclick = () => deleteMemory(best.id);
   } else {
@@ -332,7 +357,7 @@ function renderAnswer(out) {
       `${esc(out.plan.path)} path` : '') + `</div>`;
   if (out.sources && out.sources.length) {
     html += '<ul class="sources">' + out.sources.map(s =>
-      `<li>${esc(s.citation)} ${esc(s.source_type)}: "${esc(s.title)}" — ` +
+      `<li>${esc(s.citation)} ${esc(s.source_type)}: "${esc(s.chunk_title || s.title)}" — ` +
       `${Number(s.score).toFixed(2)}</li>`).join('') + '</ul>';
     flashNodes(out.sources.map(s => s.memory_id), {r: 87, g: 200, b: 123});
   }
@@ -382,8 +407,13 @@ function handleEvent(m) {
   else if (m.topic === 'recall') addRelatedCard(d);
   else if (m.topic === 'answer') renderAnswer(d);
   else if (m.topic === 'device_health') renderDevices(d.devices);
-  else if (m.topic === 'memory_added') { loadMemories(); refreshLinks(); }
+  else if (m.topic === 'memory_added') {
+    loadMemories().then(() =>
+      flashNodes([d.memory_id], {r: 240, g: 160, b: 48}));   // new dot pulses
+    refreshLinks();
+  }
   else if (m.topic === 'memory_deleted') { removeNode(d.memory_id); }
+  else if (m.topic === 'consolidated') { reloadAll(); }   // Dream tier ran
 }
 connect();
 
@@ -411,6 +441,17 @@ digestBtn.addEventListener('click', async () => {
     digestOut.textContent = 'digest failed — is the hub up?';
   } finally { digestBtn.disabled = false; }
 });
+
+// Dream tier merged/archived memories server-side — rebuild the constellation
+// so absorbed dots disappear and fresh similarity links come in.
+async function reloadAll() {
+  nodes.length = 0;
+  selectedId = null;
+  memCount.textContent = 0;
+  await loadMemories();
+  await loadCommunities();
+  refreshLinks();
+}
 
 // ------------------------------------------------------ initial population
 async function loadMemories() {
@@ -444,7 +485,7 @@ async function refreshBench() {
 function esc(s) { const d = document.createElement('div');
   d.textContent = s ?? ''; return d.innerHTML; }
 
-loadMemories().then(refreshLinks);
+loadMemories().then(loadCommunities).then(refreshLinks);
 refreshBench();
 setInterval(refreshBench, 5000);
 </script>

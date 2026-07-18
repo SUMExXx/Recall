@@ -39,7 +39,14 @@ class LLM(Protocol):
     @property
     def available(self) -> bool: ...
     def generate(self, prompt: str, *, json: bool = False,
-                 timeout: float = 180.0) -> str: ...
+                 schema: dict | None = None, timeout: float = 180.0) -> str:
+        """`schema`, when given, requests JSON-schema-constrained decoding
+        (Ollama's grammar-constrained `format`) — the model is prevented from
+        emitting anything that doesn't match, including any `enum` fields.
+        Prefer this over `json=True` whenever the shape is known: it turns
+        "the model echoed the placeholder back" into a class of error that
+        can no longer happen, rather than one you detect-and-retry."""
+        ...
 
 
 @runtime_checkable
@@ -56,7 +63,7 @@ class NullLLM:
     available = False
 
     def generate(self, prompt: str, *, json: bool = False,
-                 timeout: float = 180.0) -> str:
+                 schema: dict | None = None, timeout: float = 180.0) -> str:
         raise RuntimeError("no LLM configured on this backend")
 
 

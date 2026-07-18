@@ -122,6 +122,7 @@ class Chunk:
     text: str
     char_start: int
     char_end: int
+    title: str = ""                                    # extractive, see chunker.py
     episode_ids: list = field(default_factory=list)   # meetings only
     t_start: float | None = None                      # meetings only
     t_end: float | None = None

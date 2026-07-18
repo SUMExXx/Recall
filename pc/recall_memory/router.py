@@ -19,11 +19,52 @@ import numpy as np
 
 from .config import RecallConfig, WEIGHT_PROFILES
 from .store import MemoryStore
+from .tracing import step
 
 QUERY_TYPES = ("meeting", "code", "decision", "timeline", "general")
 
 _DEFAULT_NEEDS = {"bm25": True, "vector": True, "graph": True,
                   "metadata_filter": True, "entity_index": True}
+
+# Below this word count, an LLM classification call buys nothing — "hi",
+# "thanks", "ok" have no plan worth extracting — but still cost a full local
+# LLM round-trip (measured: 5-16s) if tier-3 is on. Tiers 0/1 already handle
+# every query with real structure (commands, dates, decision/code/timeline
+# keywords); this only skips tier-3 for the trivial leftovers, straight to
+# the ~2ms embedding-prototype tier instead.
+_TIER3_MIN_WORDS = 3
+
+# Tier-3 planner: a real JSON Schema (not a pipe-joined placeholder string) so
+# constrained decoding can enforce query_type/path as an `enum` — see _tier3().
+_TIER3_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "query_type": {"type": "string", "enum": list(QUERY_TYPES)},
+        "entities": {"type": "array", "items": {"type": "string"}},
+        "filters": {
+            "type": "object",
+            "properties": {
+                "date_range": {"type": ["array", "null"]},
+                "source_type": {"type": ["string", "null"]},
+                "speaker": {"type": ["string", "null"]},
+            },
+        },
+        "needs": {
+            "type": "object",
+            "properties": {k: {"type": "boolean"} for k in _DEFAULT_NEEDS},
+        },
+        "path": {"type": "string", "enum": ["fast", "deep"]},
+        "rerank": {"type": "boolean"},
+    },
+    "required": ["query_type", "path"],
+}
+
+_TIER3_EXAMPLE = json.dumps({
+    "query_type": "decision", "entities": ["Redis"],
+    "filters": {"date_range": None, "source_type": None, "speaker": None},
+    "needs": {"bm25": True, "vector": False, "graph": True,
+             "metadata_filter": True, "entity_index": True},
+    "path": "deep", "rerank": True})
 
 
 @dataclass
@@ -215,48 +256,80 @@ class Router:
         return RoutePlan(query_type=best_qt, weight_profile=profile, tier=2)
 
     def _tier3(self, query: str) -> RoutePlan | None:
-        """LLM planner: emits the plan JSON; validated, one retry, tier-1 fallback."""
+        """LLM planner: emits the plan JSON; validated, one retry, tier-1 fallback.
+
+        Uses JSON-schema-constrained decoding (an `enum` for query_type/path,
+        not a pipe-joined placeholder string embedded in the prompt) plus one
+        concrete few-shot example. The earlier version showed the model the
+        literal string "meeting|code|decision|timeline|general" as the VALUE
+        to fill in — small models (llama3.2:3b) would parrot that placeholder
+        back verbatim as their answer, fail validation, and burn a full retry
+        (and ~20s) before landing on a real value, on every single tier-3
+        call. A real JSON schema makes that class of failure structurally
+        impossible on backends that honor it (Ollama); the enum check below
+        stays as a safety net for backends where schema support is best-effort
+        (GenieX/QAIRT — see QwenGenieLLM.generate).
+        """
         if self.llm is None:
             return None
-        schema_hint = json.dumps({
-            "query_type": "meeting|code|decision|timeline|general",
-            "entities": ["..."],
-            "filters": {"date_range": None, "source_type": None, "speaker": None},
-            "needs": _DEFAULT_NEEDS, "path": "fast|deep", "rerank": True})
-        prompt = (f"Classify this memory-recall query and emit a retrieval plan "
-                  f"as JSON matching exactly this shape:\n{schema_hint}\n"
-                  f"Query: {query}\nJSON only.")
-        for _ in range(2):
-            try:
-                content = self.llm.generate(prompt, json=True, timeout=60)
-                plan = json.loads(content)
-                qt = plan.get("query_type", "general")
-                if qt not in QUERY_TYPES:
+        prompt = (
+            "Classify this memory-recall query and emit a retrieval plan as JSON.\n\n"
+            f'Example — query "Who decided to use Redis?" ->\n{_TIER3_EXAMPLE}\n\n'
+            f"Query: {query}\nJSON only.")
+        for attempt in range(1, 3):
+            with step("router:tier3_llm_planner", attempt=attempt,
+                      model=getattr(self.llm, "model", self.llm.name)) as s:
+                s.detail(prompt=prompt)
+                try:
+                    content = self.llm.generate(prompt, schema=_TIER3_SCHEMA,
+                                                timeout=60)
+                    s.detail(response=content)
+                    plan = json.loads(content)
+                    qt = plan.get("query_type", "general")
+                    if qt not in QUERY_TYPES:
+                        s.detail(rejected=f"unknown query_type {qt!r}")
+                        continue
+                    needs = {k: bool(plan.get("needs", {}).get(k, v))
+                             for k, v in _DEFAULT_NEEDS.items()}
+                    s.detail(accepted=True, query_type=qt)
+                    return RoutePlan(
+                        query_type=qt, entities=list(plan.get("entities") or []),
+                        filters={k: v for k, v in (plan.get("filters") or {}).items() if v},
+                        needs=needs, path=plan.get("path", "deep"),
+                        rerank=bool(plan.get("rerank", True)),
+                        weight_profile=qt if qt in WEIGHT_PROFILES else "general",
+                        tier=3)
+                except Exception as e:
+                    s.detail(parse_error=str(e))
                     continue
-                needs = {k: bool(plan.get("needs", {}).get(k, v))
-                         for k, v in _DEFAULT_NEEDS.items()}
-                return RoutePlan(
-                    query_type=qt, entities=list(plan.get("entities") or []),
-                    filters={k: v for k, v in (plan.get("filters") or {}).items() if v},
-                    needs=needs, path=plan.get("path", "deep"),
-                    rerank=bool(plan.get("rerank", True)),
-                    weight_profile=qt if qt in WEIGHT_PROFILES else "general",
-                    tier=3)
-            except Exception:
-                continue
         return None
 
     def route(self, query: str, query_vec: np.ndarray | None = None) -> RoutePlan:
-        plan = _tier0(query)
+        with step("router:tier0_command_grammar") as s:
+            plan = _tier0(query)
+            s.detail(matched=plan is not None,
+                     command=plan.command if plan else None)
         if plan:
             return plan
-        plan = _tier1(query, self.store)
+
+        with step("router:tier1_rules_and_filters") as s:
+            plan = _tier1(query, self.store)
+            s.detail(matched=plan is not None,
+                     query_type=plan.query_type if plan else None,
+                     filters=plan.filters if plan else None)
         if plan:
             return plan
-        if self.cfg.use_tier3_planner and self.llm is not None and self.llm.available:
-            plan = self._tier3(query)
+
+        if (self.cfg.use_tier3_planner and len(query.split()) >= _TIER3_MIN_WORDS
+                and self.llm is not None and self.llm.available):
+            plan = self._tier3(query)   # instruments its own step(s)
             if plan:
                 return plan
+
         if self.embedder is not None and query_vec is not None:
-            return self._tier2(query, query_vec)
+            with step("router:tier2_embedding_prototype") as s:
+                plan = self._tier2(query, query_vec)
+                s.detail(query_type=plan.query_type,
+                         weight_profile=plan.weight_profile)
+            return plan
         return RoutePlan(tier=1)  # tier-1 default: general, everything on

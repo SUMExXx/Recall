@@ -7,6 +7,7 @@ instance (the hub, the CLI) avoid loading a model more than once.
 """
 from __future__ import annotations
 
+from .. import tracing
 from ..config import RecallConfig
 from .base import (LLM, Backend, Embedder, NullLLM, PassthroughReranker,
                    Reranker, Tokenizer)
@@ -14,6 +15,7 @@ from .base import (LLM, Backend, Embedder, NullLLM, PassthroughReranker,
 
 def get_backend(cfg: RecallConfig | None = None) -> Backend:
     cfg = cfg or RecallConfig()
+    tracing.configure(cfg)   # single choke point every entry path passes through
     if cfg.backend == "hash":
         from .hash_backend import HashBackend
         return HashBackend(cfg)

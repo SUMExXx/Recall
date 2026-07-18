@@ -5,9 +5,11 @@ import json
 import numpy as np
 import pytest
 
-from recall_memory.chunker import chunk_document, chunk_meeting
+from recall_memory.chunker import _extractive_title, chunk_document, chunk_meeting
 from recall_memory.config import CHUNK_SPECS, DIM_COARSE, DIM_FULL, RecallConfig
 from recall_memory.consolidate import Consolidator
+from recall_memory.extractors import llm_extract_relation
+from recall_memory.llm_validate import is_valid_llm_summary, is_valid_relation
 from recall_memory.okf import OKFGenerator
 from recall_memory.demo_data import (SAMPLE_GITHUB, SAMPLE_OCR, SAMPLE_PDF,
                                      sample_meeting, sample_meeting_phone, seed)
@@ -15,9 +17,26 @@ from recall_memory.embeddings import HashEmbedder, matryoshka_coarse
 from recall_memory.ingest import Ingestor
 from recall_memory.nmo import NMO, Episode, new_id
 from recall_memory.retrieval import Retriever
-from recall_memory.router import Router
+from recall_memory.router import _TIER3_SCHEMA, QUERY_TYPES, Router, _TIER3_MIN_WORDS
 from recall_memory.store import MemoryStore
 from recall_memory.tokenizer import count_tokens, tokenize
+
+
+class FakeLLM:
+    """Deterministic stand-in for backend.llm — feeds scripted responses in
+    order and records every call so tests can assert on the prompt/schema
+    actually used, without needing Ollama."""
+    name = "fake"
+    model = "fake-model"
+    available = True
+
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls = []
+
+    def generate(self, prompt, *, json=False, schema=None, timeout=180.0):
+        self.calls.append({"prompt": prompt, "json": json, "schema": schema})
+        return self.responses.pop(0)
 
 
 @pytest.fixture()
@@ -102,6 +121,102 @@ def test_speaker_attribution_never_split():
         assert not first_line.rstrip().endswith(":") or " " in first_line.strip()
 
 
+def test_opening_a_pre_migration_db_backfills_missing_columns(tmp_path):
+    """Regression: `CREATE TABLE IF NOT EXISTS` is a no-op on a database file
+    that predates a new column (e.g. an existing demo_hub.db from before
+    chunks.title existed) — every row is then simply missing that column and
+    reading row["title"] raises IndexError, crashing live capture. Simulate
+    exactly that: a chunks table built from the schema with `title` (and its
+    index) stripped out, then confirm MemoryStore opens it without error and
+    the column is present afterward."""
+    import sqlite3
+    db_path = str(tmp_path / "pre_migration.db")
+    raw = sqlite3.connect(db_path)
+    raw.execute("""CREATE TABLE chunks (
+      chunk_id INTEGER PRIMARY KEY AUTOINCREMENT, memory_id TEXT NOT NULL,
+      chunk_index INTEGER NOT NULL, token_count INTEGER NOT NULL,
+      text TEXT NOT NULL, char_start INTEGER NOT NULL, char_end INTEGER NOT NULL,
+      episode_ids TEXT DEFAULT '[]', t_start REAL, t_end REAL,
+      speaker_span TEXT DEFAULT '[]', source_type TEXT NOT NULL,
+      created_at INTEGER NOT NULL, language TEXT DEFAULT 'en',
+      importance REAL DEFAULT 0.0, confidence REAL DEFAULT 1.0,
+      user TEXT DEFAULT 'default', device TEXT DEFAULT '',
+      processing_version TEXT NOT NULL, meeting_id TEXT, repo TEXT,
+      file_path TEXT, page INTEGER, document_title TEXT, ocr_confidence REAL,
+      emb_full BLOB)""")
+    raw.execute("INSERT INTO chunks(memory_id, chunk_index, token_count, text, "
+               "char_start, char_end, source_type, created_at, "
+               "processing_version) VALUES ('m1',0,1,'x',0,1,'text',1,'v2.0')")
+    raw.commit()
+    raw.close()
+
+    store = MemoryStore(db_path)   # must not raise
+    row = store.db.execute("SELECT * FROM chunks LIMIT 1").fetchone()
+    assert "title" in row.keys()
+    assert row["title"] == ""
+    store.close()
+
+
+def test_chunk_title_is_extractive_not_parent_title():
+    """Every chunk of a memory used to show the SAME parent-memory title in
+    citations — now each chunk carries its own short, deterministic label,
+    with the speaker prefix stripped for meeting transcript lines."""
+    assert _extractive_title("Priya: We decided to use JWT.") \
+        == "We decided to use JWT."
+    long_title = _extractive_title(
+        "Priya: We decided to use JWT authentication with refresh tokens "
+        "for the backend API.")
+    assert len(long_title) <= 70
+    assert long_title.endswith("…")
+    assert not long_title.startswith("Priya")
+
+
+def test_chunk_titles_differ_across_a_long_meeting(seeded):
+    store, *_ = seeded
+    rows = store.db.execute(
+        "SELECT title FROM chunks WHERE source_type='meeting'").fetchall()
+    titles = [r["title"] for r in rows]
+    assert all(t for t in titles)          # every chunk got a non-empty title
+    assert len(set(titles)) > 1            # not all identical
+
+
+def test_retrieval_exposes_chunk_title(seeded):
+    store, cfg, ing, _ = seeded
+    r = Retriever(store, cfg, ing.backend)
+    ctxs = r.retrieve("Who decided to use JWT authentication?")
+    assert ctxs and all(c.chunk_title for c in ctxs)
+
+
+# -------------------------------------------------------- ollama backend
+
+def test_ollama_llm_disables_thinking_mode(monkeypatch):
+    """Regression: gemma4:latest (a "thinking"-capable Ollama model) spent its
+    entire num_predict budget on hidden reasoning tokens and returned an
+    EMPTY content string (done_reason="length") for a trivial tier-3 call —
+    confirmed directly against a running Ollama instance. `think: False` must
+    be sent on every call so bounded-latency generation isn't silently eaten
+    by hidden reasoning tokens."""
+    from recall_memory.backends.ollama import OllamaLLM
+    from recall_memory.config import RecallConfig
+    import requests
+    captured = {}
+
+    class FakeResp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"message": {"content": "ok"}}
+
+    def fake_post(url, json=None, timeout=None):
+        captured.update(body=json)
+        return FakeResp()
+    monkeypatch.setattr(requests, "post", fake_post)
+    llm = OllamaLLM(RecallConfig(backend="ollama"))
+    llm.generate("hello")
+    assert captured["body"]["think"] is False
+
+
 # ----------------------------------------------------------- embeddings
 
 def test_matryoshka_coarse_shape_and_range():
@@ -180,6 +295,51 @@ def test_router_tier1_speaker_filter(seeded):
     store, cfg, ing, _ = seeded
     plan = Router(store, cfg, ing.embedder).route("What did Priya decide?")
     assert plan.filters.get("speaker") == "Priya"
+
+
+def test_router_tier3_uses_schema_not_bare_json_flag(store, cfg):
+    """Regression for the "model echoes the enum placeholder back verbatim"
+    bug: the planner must request schema-constrained decoding (with a real
+    `enum` for query_type/path), not the old json=True + pipe-joined
+    placeholder string embedded in the prompt."""
+    fake = FakeLLM(['{"query_type": "decision", "path": "deep"}'])
+    r = Router(store, cfg, llm=fake)
+    plan = r._tier3("who decided to use redis?")
+    assert plan is not None and plan.query_type == "decision" and plan.tier == 3
+    call = fake.calls[0]
+    assert call["schema"] == _TIER3_SCHEMA
+    assert call["schema"]["properties"]["query_type"]["enum"] == list(QUERY_TYPES)
+    # the prompt must show a concrete example, never the pipe-joined enum
+    assert "meeting|code|decision|timeline|general" not in call["prompt"]
+
+
+def test_router_tier3_retries_past_a_placeholder_echo(store, cfg):
+    """Reproduces the exact failure from the bug report: attempt 1 echoes the
+    schema's enum values back as a literal pipe-joined string; that must be
+    rejected (not QUERY_TYPES) and retried, landing on attempt 2's real value."""
+    fake = FakeLLM([
+        '{"query_type": "meeting|code|decision|timeline|general", "path": "fast|deep"}',
+        '{"query_type": "general", "path": "deep"}'])
+    r = Router(store, cfg, llm=fake)
+    plan = r._tier3("what was the vector size")
+    assert plan is not None and plan.query_type == "general"
+    assert len(fake.calls) == 2
+
+
+def test_router_tier3_skipped_for_trivial_short_query(store, cfg):
+    """Regression: a bare greeting like "hi" has no plan worth extracting via
+    LLM, but with tier-3 enabled it still cost a full local round-trip
+    (measured 5-16s, and up to two failed attempts against a "thinking"
+    model that burns its whole token budget reasoning about "hi" before
+    ever emitting JSON). Below _TIER3_MIN_WORDS, tier-3 must not even be
+    attempted — straight through to tier-2 instead."""
+    fake = FakeLLM(["should never be called"])
+    r = Router(store, cfg, embedder=HashEmbedder(), llm=fake)
+    trivial = " ".join(["word"] * (_TIER3_MIN_WORDS - 1))
+    vec = HashEmbedder().embed_query(trivial)
+    plan = r.route(trivial, vec)
+    assert plan.tier == 2
+    assert fake.calls == []
 
 
 def test_router_tier2_fallthrough(seeded):
@@ -385,6 +545,85 @@ def test_run_full_reports_every_job(seeded):
                 "summaries", "archived", "graph_repaired", "llm_relations", "okf"):
         assert key in out
     assert out["graph_repaired"] == 0   # nothing orphaned in a clean store
+
+
+# ------------------------------------------------------- LLM output validation
+
+def test_is_valid_llm_summary_rejects_refusal_and_off_topic():
+    facts = "decisions=['use JWT for auth']; participants=['Priya','Rahul']"
+    assert not is_valid_llm_summary(
+        "I'm a large language model, I don't have personal memories of this "
+        "conversation. Please provide the specific text.", facts)
+    assert not is_valid_llm_summary(
+        "Memory Retrieval Overview\n- a system for retrieving memories", facts)
+    assert not is_valid_llm_summary("ok", facts)   # too short
+    assert is_valid_llm_summary(
+        "The team decided to use JWT for authentication.", facts)
+
+
+def test_is_valid_relation_rejects_hallucinated_object():
+    source = "we decided to use JWT authentication for the backend API"
+    assert is_valid_relation("team", "JWT authentication", source)
+    assert not is_valid_relation("team", "a year old memory about Ole Miss",
+                                source)
+    assert not is_valid_relation("", "something", source)
+
+
+def test_summarize_falls_back_to_extractive_on_invalid_llm_output(store, cfg,
+                                                                  ingestor):
+    """Reproduces the exact failure: the small model answers with a
+    disclaimer instead of a summary; that must NOT get written verbatim —
+    the extractive fallback text is kept instead."""
+    c = Consolidator(store, cfg, ingestor)
+    c.llm = FakeLLM(["I'm a large language model and don't have access to "
+                     "that information."])
+    extractive = "Decisions: use JWT for auth"
+    assert c._summarize(extractive, extractive) == extractive
+
+
+def test_okf_llm_polish_falls_back_on_disclaimer(store, cfg):
+    gen = OKFGenerator(store, cfg, llm=FakeLLM(["As an AI language model, I "
+                                                "cannot access your memories."]))
+    facts = "meeting_id=mtg-1; decisions=['use JWT']"
+    assert gen._maybe_summarize("fallback text", facts) == "fallback text"
+
+
+def test_llm_extract_relation_rejects_hallucinated_triple():
+    # object shares NO vocabulary with the sentence it was supposedly
+    # extracted from -> the heuristic's actual catchable case (a hallucinated
+    # triple whose garbage happens to echo the source's own garbage, e.g. two
+    # different "Ole Miss" mentions from the same ASR hallucination loop, is
+    # a known limitation — see llm_validate.py's docstring).
+    fake = FakeLLM(['{"subject": "memory retrieval", "predicate": "works", '
+                    '"object": "a completely unrelated topic never mentioned"}'])
+    sentence = "we decided to use JWT authentication for the backend API"
+    assert llm_extract_relation(sentence, fake) is None
+
+
+def test_llm_extract_relation_accepts_on_topic_triple():
+    fake = FakeLLM(['{"subject": "team", "predicate": "decided", '
+                    '"object": "use JWT authentication"}'])
+    sentence = "we decided to use JWT authentication for the backend API"
+    rel = llm_extract_relation(sentence, fake)
+    assert rel == {"subject": "team", "predicate": "decided",
+                   "object": "use JWT authentication"}
+
+
+# ---------------------------------------------------- job 7: re-embedding
+
+def test_job_reembed_updates_stale_chunks(seeded):
+    store, cfg, ing, _ = seeded
+    store.db.execute("UPDATE chunks SET processing_version='v0.1-old'")
+    store.commit()
+    n_stale = store.stats()["chunks"]
+    n = Consolidator(store, cfg, ing).job_reembed()
+    assert n == n_stale
+    from recall_memory.config import PROCESSING_VERSION
+    versions = {r["processing_version"] for r in store.db.execute(
+        "SELECT DISTINCT processing_version FROM chunks")}
+    assert versions == {PROCESSING_VERSION}
+    # idempotent — nothing left to re-embed on a second pass
+    assert Consolidator(store, cfg, ing).job_reembed() == 0
 
 
 # -------------------------------------------------------------- ask (offline)

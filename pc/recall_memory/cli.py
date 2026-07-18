@@ -108,13 +108,14 @@ def _main(argv=None) -> int:
             print(out["answer"])
             print("\nSources:")
             for c in out["contexts"]:
-                print(f"  {c.citation()} {c.source_type:12s} {c.title}")
+                print(f"  {c.citation()} {c.source_type:12s} "
+                      f"{c.chunk_title or c.title}")
 
     elif args.cmd == "search":
         r = Retriever(store, cfg, backend)
         for c in r.retrieve(args.query, top_k=args.k):
             print(f"{c.score:6.3f} {c.citation()} {c.source_type:12s} "
-                  f"{c.title[:40]:40s} {c.text[:80]!r}")
+                  f"{(c.chunk_title or c.title)[:40]:40s} {c.text[:80]!r}")
 
     elif args.cmd == "ingest-meeting":
         with open(args.file, encoding="utf-8") as f:

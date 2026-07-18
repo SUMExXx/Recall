@@ -85,12 +85,61 @@ def test_asr_selection_policy():
 
 
 def test_make_local_whisper_modes():
-    cfg = RecallConfig(backend="hash")
+    cfg = RecallConfig(backend="hash", asr_mode="auto")
     # auto: faster-whisper is installed in this venv -> in-process provider
     assert isinstance(make_local_whisper(cfg), FasterWhisperProvider)
     # http: always the external-server contract
     cfg_http = RecallConfig(backend="hash", asr_mode="http")
     assert isinstance(make_local_whisper(cfg_http), WhisperLocalProvider)
+
+
+def test_hallucination_loop_collapsed():
+    from hub.asr import _collapse_hallucination_loop
+    assert _collapse_hallucination_loop("Yeah. " * 23) == "Yeah."
+    normal = "we decided to use JWT authentication for the backend API"
+    assert _collapse_hallucination_loop(normal) == normal
+
+
+# --------------------------------------------------------------- sarvam
+
+def test_sarvam_provider_no_key_raises_without_network_call():
+    from hub.asr import SarvamCloudProvider
+    p = SarvamCloudProvider(api_key="")
+    with pytest.raises(RuntimeError, match="RECALL_SARVAM_API_KEY"):
+        p.transcribe({"audio": b"RIFF....WAVEfmt "})
+
+
+def test_sarvam_provider_parses_real_rest_contract(monkeypatch):
+    """docs.sarvam.ai/api-reference/speech-to-text/transcribe: POST
+    api.sarvam.ai/speech-to-text, header api-subscription-key, multipart
+    file/model/language_code/mode, response {transcript, language_code,
+    language_probability}."""
+    from hub.asr import SarvamCloudProvider
+    import requests
+    captured = {}
+
+    class FakeResp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"transcript": "namaste duniya", "language_code": "hi-IN",
+                    "language_probability": 0.93}
+
+    def fake_post(url, headers=None, files=None, data=None, timeout=None):
+        captured.update(url=url, headers=headers, data=data, timeout=timeout)
+        return FakeResp()
+    monkeypatch.setattr(requests, "post", fake_post)
+    p = SarvamCloudProvider(api_key="test-key", model="saaras:v3",
+                            language_code="unknown", timeout=3.0)
+    res = p.transcribe({"audio": b"RIFF....WAVEfmt "})
+    assert res.text == "namaste duniya"
+    assert res.lang == "hi-IN"
+    assert res.confidence == pytest.approx(0.93)
+    assert captured["url"] == "https://api.sarvam.ai/speech-to-text"
+    assert captured["headers"]["api-subscription-key"] == "test-key"
+    assert captured["data"]["model"] == "saaras:v3"
+    assert captured["timeout"] == 3.0
 
 
 # ------------------------------------------------------------ proactive
@@ -114,6 +163,29 @@ def test_proactive_fires_once_with_cooldown():
                        now=now + 120) is not None
 
 
+def test_proactive_attempt_throttle_even_without_a_fire():
+    """Regression: the fire-cooldown alone is fail-OPEN — it only ever moves
+    on a SUCCESSFUL recall, so a dry spell (nothing in the store matches)
+    never throttled anything, and every single ASR-transcribed chunk
+    re-embedded + retrieved. The attempt-throttle must gate every call,
+    fire or not."""
+    store = MemoryStore(":memory:")           # nothing ingested -> always dry
+    cfg = RecallConfig(db_path=":memory:", backend="hash")
+    ing = Ingestor(store, cfg)
+    eng = ProactiveRecallEngine(Retriever(store, cfg, ing.backend), threshold=0.05)
+    calls = {"n": 0}
+    orig_retrieve = eng.retriever.retrieve
+
+    def counting_retrieve(*a, **kw):
+        calls["n"] += 1
+        return orig_retrieve(*a, **kw)
+    eng.retriever.retrieve = counting_retrieve
+    now = time.time()
+    for i in range(10):    # 10 rapid observes across ~9 s of continuous speech
+        eng.observe(f"just talking about nothing in particular {i}", now=now + i)
+    assert calls["n"] <= 2, "attempt-throttle must gate dry (never-fires) calls too"
+
+
 # ------------------------------------------------------------ REST layer
 
 def test_rest_health_stats_policy(client):
@@ -130,6 +202,7 @@ def test_rest_ask_and_forget_flow(client, state):
     out = client.post("/ask", json={"query": "Who decided to use JWT?"}).json()
     assert out["sources"], "ask must return sources"
     assert out["plan"]["query_type"] == "decision"
+    assert all(s["chunk_title"] for s in out["sources"])
     dump = client.get("/dump").json()
     assert len(dump) == 5
     out = client.post("/forget", json={"meeting_id": "mtg-auth-sync",
@@ -278,6 +351,99 @@ def test_ws_audio_ingest(client, state, monkeypatch):
     assert "hello from audio" in sess_mem["content"]
 
 
+def test_flush_audio_routes_indic_to_sarvam_when_cloud_allowed(client, state,
+                                                               monkeypatch):
+    """Bug: sarvam_cloud existed but flush_audio hardcoded lang='en' when
+    calling the old selection helper, so it could never be selected. Local
+    Whisper's own language ID must now gate a Sarvam attempt for Indic audio
+    when the user has opted into cloud."""
+    from hub.asr import ASRResult
+    monkeypatch.setattr(
+        state.asr_providers["whisper_local"], "transcribe",
+        lambda payload: ASRResult(text="namaste duniya", lang="hi", confidence=0.5))
+    monkeypatch.setattr(
+        state.asr_providers["sarvam_cloud"], "transcribe",
+        lambda payload: ASRResult(text="namaste duniya (sarvam)", lang="hi-IN",
+                                  confidence=0.95))
+    state.policy.update(cloud_optin=True)
+    with client.websocket_connect("/ws") as ws:
+        ws.send_text(json.dumps({"type": "hello", "device_id": "indic-cap",
+                                 "role": "phone"}))
+        json.loads(ws.receive_text()); json.loads(ws.receive_text())
+        ws.send_text(json.dumps({"type": "meeting_start",
+                                 "capture_device": "mobile"}))
+        [json.loads(ws.receive_text()) for _ in range(2)]
+        ws.send_bytes(b"\x00\x00" * (16000 * 4))     # ~4 s -> triggers a flush
+        evt = json.loads(ws.receive_text())
+        while evt.get("topic") != "transcript":
+            evt = json.loads(ws.receive_text())
+        assert evt["data"]["text"] == "namaste duniya (sarvam)"
+        ws.send_text(json.dumps({"type": "meeting_end"}))
+        while json.loads(ws.receive_text()).get("type") != "meeting_ended":
+            pass
+
+
+def test_flush_audio_skips_sarvam_when_cloud_not_opted_in(client, state,
+                                                          monkeypatch):
+    from hub.asr import ASRResult
+    monkeypatch.setattr(
+        state.asr_providers["whisper_local"], "transcribe",
+        lambda payload: ASRResult(text="namaste duniya", lang="hi", confidence=0.5))
+    monkeypatch.setattr(
+        state.asr_providers["hinglish_local"], "transcribe",
+        lambda payload: ASRResult(text="namaste duniya (hinglish)", lang="hi",
+                                  confidence=0.8))
+
+    def must_not_be_called(payload):
+        raise AssertionError("sarvam_cloud must not run without cloud opt-in")
+    monkeypatch.setattr(state.asr_providers["sarvam_cloud"], "transcribe",
+                        must_not_be_called)
+    # cloud_optin left at its default (False)
+    with client.websocket_connect("/ws") as ws:
+        ws.send_text(json.dumps({"type": "hello", "device_id": "indic-cap2",
+                                 "role": "phone"}))
+        json.loads(ws.receive_text()); json.loads(ws.receive_text())
+        ws.send_text(json.dumps({"type": "meeting_start",
+                                 "capture_device": "mobile"}))
+        [json.loads(ws.receive_text()) for _ in range(2)]
+        ws.send_bytes(b"\x00\x00" * (16000 * 4))
+        evt = json.loads(ws.receive_text())
+        while evt.get("topic") != "transcript":
+            evt = json.loads(ws.receive_text())
+        assert evt["data"]["text"] == "namaste duniya (hinglish)"
+        ws.send_text(json.dumps({"type": "meeting_end"}))
+        while json.loads(ws.receive_text()).get("type") != "meeting_ended":
+            pass
+
+
+def test_desktop_capture_source(state):
+    """A desktop capture must land as NMO source/device 'desktop' (§3/§4a),
+    not the arduino default."""
+    sess = state.sessions.start("desktop-capture", "desktop")
+    sess.add_utterance("testing the desktop capture flow end to end")
+    mid = state.sessions.end("desktop-capture")
+    row = state.store.get_memory(mid)
+    assert row["source"] == "desktop"
+    assert row["device"] == "desktop"
+
+
+def test_untitled_session_auto_titles_from_content(state):
+    """No explicit title -> memory is named after what was said, not a
+    generic 'Web fallback capture' label."""
+    sess = state.sessions.start("web-capture", "mobile")     # no title
+    sess.add_utterance("we decided to use JWT authentication with refresh "
+                       "tokens for the backend API", speaker="Priya")
+    mid = state.sessions.end("web-capture")
+    title = state.store.get_memory(mid)["title"]
+    assert title.startswith("we decided to use JWT")
+    assert len(title) <= 60
+    # explicit titles are kept verbatim
+    sess = state.sessions.start("web-capture", "mobile", title="standup")
+    sess.add_utterance("some words were said here today")
+    mid = state.sessions.end("web-capture")
+    assert state.store.get_memory(mid)["title"] == "standup"
+
+
 def test_ws_events_legacy_alias(client, state):
     """Old 1.0 dashboards connect to /ws/events — must work, not 403."""
     with client.websocket_connect("/ws/events") as ws:
@@ -288,12 +454,32 @@ def test_ws_events_legacy_alias(client, state):
 
 
 def test_links_and_digest(client, state):
+    from unittest.mock import patch
+    import time
+    import recall_memory.demo_data as dd
+    dd._NOW = None
+    # Force mock time to 12:00 PM local time to avoid midnight roll-over issues
+    fixed_time = time.mktime((2026, 7, 19, 12, 0, 0, 6, 200, 1))
+    with patch("time.time", return_value=fixed_time), \
+         patch("time.localtime", return_value=time.struct_time((2026, 7, 19, 12, 0, 0, 6, 200, 1))):
+        seed(state.ingestor)
+        edges = client.get("/links?threshold=0.05").json()
+        assert edges and {"a", "b", "score", "why"} <= set(edges[0])
+        # the JWT-heavy sample set must produce at least one explained edge
+        assert any(e["why"] for e in edges)
+        assert client.get("/links?threshold=1.1").json() == []
+        out = client.post("/digest").json()
+        assert out["count"] == 5 and "Auth design sync" in out["digest"]
+
+
+def test_communities_endpoint(client, state):
     seed(state.ingestor)
-    edges = client.get("/links?threshold=0.05").json()
-    assert edges and {"a", "b", "score"} <= set(edges[0])
-    assert client.get("/links?threshold=1.1").json() == []
-    out = client.post("/digest").json()
-    assert out["count"] == 5 and "Auth design sync" in out["digest"]
+    assert client.get("/communities").json() == []   # dream hasn't run yet
+    client.post("/consolidate")                       # MVP jobs only
+    state.consolidator.job_communities()
+    out = client.get("/communities").json()
+    assert out and {"community_id", "label", "members"} <= set(out[0])
+    assert len(out[0]["members"]) >= 2                # JWT bridges the sources
 
 
 # ------------------------------------------------------------ MCP server

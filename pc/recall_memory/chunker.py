@@ -10,6 +10,7 @@ niceties are the cheap boundary preferences from the plan table:
 """
 from __future__ import annotations
 
+import re
 from typing import Callable
 
 from .config import CHUNK_SPECS, ChunkSpec
@@ -25,6 +26,26 @@ Tokenize = Callable[[str], list[Token]]
 # How far back (fraction of window) we will move a cut to honor a cheap boundary.
 _BOUNDARY_SLACK = 0.10
 
+_TITLE_MAX_CHARS = 70
+_SENTENCE_END_RE = re.compile(r"[.!?](?:\s|$)")
+_SPEAKER_PREFIX_RE = re.compile(r"^([A-Za-z][\w\s]{0,30}?):\s+")
+
+
+def _extractive_title(text: str) -> str:
+    """A short, deterministic label from the CHUNK's own text — every chunk
+    of a memory previously showed the same generic parent-memory title in
+    citations/dashboard, making it impossible to tell which part of a long
+    meeting a given hit actually came from. First clause, sentence-bounded
+    where cheap, speaker-label stripped for meetings, no LLM call."""
+    t = _SPEAKER_PREFIX_RE.sub("", text.strip(), count=1)
+    m = _SENTENCE_END_RE.search(t)
+    if m and m.start() >= 8:
+        t = t[:m.start() + 1]
+    t = " ".join(t.split())
+    if len(t) > _TITLE_MAX_CHARS:
+        t = t[:_TITLE_MAX_CHARS - 1].rsplit(" ", 1)[0] + "…"
+    return t
+
 
 def _window_starts(n_tokens: int, spec: ChunkSpec) -> list[int]:
     stride = max(1, spec.size - spec.overlap)
@@ -38,9 +59,11 @@ def _make_chunk(nmo: NMO, index: int, tokens: list[Token], text: str,
                 lo: int, hi: int) -> Chunk:
     """Build a chunk over tokens[lo:hi] (hi exclusive) with exact char spans."""
     char_start, char_end = tokens[lo].start, tokens[hi - 1].end
+    chunk_text = text[char_start:char_end]
     return Chunk(
         memory_id=nmo.memory_id, chunk_index=index, token_count=hi - lo,
-        text=text[char_start:char_end], char_start=char_start, char_end=char_end,
+        text=chunk_text, char_start=char_start, char_end=char_end,
+        title=_extractive_title(chunk_text),
     ).inherit(nmo)
 
 

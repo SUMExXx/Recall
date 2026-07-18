@@ -8,11 +8,10 @@ relations       graph edges with bi-temporal fields (valid_at / invalid_at / tra
 fts_chunks      FTS5 BM25 over chunk text
 vec_chunks      sqlite-vec vec0, int8[256] Matryoshka coarse vectors (brute-force)
 """
-from __future__ import annotations
-
 import json
 import re
 import sqlite3
+import threading
 
 import numpy as np
 
@@ -48,6 +47,8 @@ CREATE TABLE IF NOT EXISTS memories (
 );
 CREATE INDEX IF NOT EXISTS idx_mem_type_time ON memories(source_type, created_at);
 CREATE INDEX IF NOT EXISTS idx_mem_hash ON memories(hash);
+CREATE INDEX IF NOT EXISTS idx_mem_created_at ON memories(created_at);
+CREATE INDEX IF NOT EXISTS idx_mem_meeting_id ON memories(json_extract(source_meta, '$.meeting_id')) WHERE source_type = 'meeting';
 
 CREATE TABLE IF NOT EXISTS episodes (
   episode_id TEXT PRIMARY KEY,
@@ -74,6 +75,7 @@ CREATE TABLE IF NOT EXISTS chunks (
   text        TEXT NOT NULL,
   char_start  INTEGER NOT NULL,
   char_end    INTEGER NOT NULL,
+  title       TEXT DEFAULT '',
   episode_ids TEXT DEFAULT '[]',
   t_start     REAL,
   t_end       REAL,
@@ -98,6 +100,8 @@ CREATE INDEX IF NOT EXISTS idx_chunk_memory ON chunks(memory_id, chunk_index);
 CREATE INDEX IF NOT EXISTS idx_chunk_type_time ON chunks(source_type, created_at);
 CREATE INDEX IF NOT EXISTS idx_chunk_meeting ON chunks(meeting_id);
 CREATE INDEX IF NOT EXISTS idx_chunk_repo ON chunks(repo, file_path);
+CREATE INDEX IF NOT EXISTS idx_chunk_created_at ON chunks(created_at);
+CREATE INDEX IF NOT EXISTS idx_chunk_proc_ver ON chunks(processing_version);
 
 CREATE TABLE IF NOT EXISTS entity_mentions (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -120,11 +124,14 @@ CREATE TABLE IF NOT EXISTS relations (
   object     TEXT NOT NULL,
   valid_at   INTEGER,
   invalid_at INTEGER,
+  chunk_id   INTEGER,
   transaction_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_rel_subject ON relations(subject, predicate);
 CREATE INDEX IF NOT EXISTS idx_rel_object ON relations(object);
 CREATE INDEX IF NOT EXISTS idx_rel_memory ON relations(memory_id);
+CREATE INDEX IF NOT EXISTS idx_rel_subject_lower ON relations(lower(subject));
+CREATE INDEX IF NOT EXISTS idx_rel_object_lower ON relations(lower(object));
 
 CREATE VIRTUAL TABLE IF NOT EXISTS fts_chunks USING fts5(
   text, memory_id UNINDEXED
@@ -180,16 +187,45 @@ class MemoryStore:
     def __init__(self, db_path: str = ":memory:", check_same_thread: bool = True):
         # check_same_thread=False is used by the hub, which serializes access
         # through a lock while handlers hop between event-loop and threadpool.
+        self.lock = threading.RLock()
         self.db = sqlite3.connect(db_path, check_same_thread=check_same_thread)
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")
+        self.db.execute("PRAGMA busy_timeout=5000")   # wait, don't throw 'locked'
         self.db.enable_load_extension(True)
         import sqlite_vec
         sqlite_vec.load(self.db)
         self.db.enable_load_extension(False)
         self.db.executescript(_SCHEMA)
         self.db.executescript(_VEC_SCHEMA)
+        self._migrate()
         self.db.commit()
+
+        # Dynamically wrap public database methods to be thread-safe
+        for name in dir(self):
+            if not name.startswith("__") and name not in ("lock", "db", "_filter_sql", "_ensure_column", "_migrate"):
+                attr = getattr(self, name)
+                if callable(attr):
+                    def make_wrapper(fn):
+                        def wrapper(*args, **kw):
+                            with self.lock:
+                                return fn(*args, **kw)
+                        return wrapper
+                    setattr(self, name, make_wrapper(attr))
+
+    def _ensure_column(self, table: str, column: str, decl: str):
+        """`CREATE TABLE IF NOT EXISTS` only creates a table that doesn't
+        exist yet — it is a no-op on a database file from before a column was
+        added, so that column is simply missing on every existing row and
+        every read of it raises IndexError. Any new column added to _SCHEMA
+        for an EXISTING table needs a matching line here."""
+        cols = {r["name"] for r in self.db.execute(f"PRAGMA table_info({table})")}
+        if column not in cols:
+            self.db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+
+    def _migrate(self):
+        self._ensure_column("chunks", "title", "TEXT DEFAULT ''")
+        self._ensure_column("relations", "chunk_id", "INTEGER")
 
     def close(self):
         self.db.close()
@@ -226,19 +262,19 @@ class MemoryStore:
         assert emb_full.shape == (DIM_FULL,) and emb_coarse.shape == (DIM_COARSE,)
         cur = self.db.execute(
             """INSERT INTO chunks(memory_id, chunk_index, token_count, text,
-                 char_start, char_end, episode_ids, t_start, t_end, speaker_span,
-                 source_type, created_at, language, importance, confidence, user,
-                 device, processing_version, meeting_id, repo, file_path, page,
-                 document_title, ocr_confidence, emb_full)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                 char_start, char_end, title, episode_ids, t_start, t_end,
+                 speaker_span, source_type, created_at, language, importance,
+                 confidence, user, device, processing_version, meeting_id, repo,
+                 file_path, page, document_title, ocr_confidence, emb_full)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (chunk.memory_id, chunk.chunk_index, chunk.token_count, chunk.text,
-             chunk.char_start, chunk.char_end, json.dumps(chunk.episode_ids),
-             chunk.t_start, chunk.t_end, json.dumps(chunk.speaker_span),
-             chunk.source_type, chunk.created_at, chunk.language, chunk.importance,
-             chunk.confidence, chunk.user, chunk.device, chunk.processing_version,
-             chunk.meeting_id, chunk.repo, chunk.file_path, chunk.page,
-             chunk.document_title, chunk.ocr_confidence,
-             emb_full.astype(np.float32).tobytes()))
+             chunk.char_start, chunk.char_end, chunk.title,
+             json.dumps(chunk.episode_ids), chunk.t_start, chunk.t_end,
+             json.dumps(chunk.speaker_span), chunk.source_type, chunk.created_at,
+             chunk.language, chunk.importance, chunk.confidence, chunk.user,
+             chunk.device, chunk.processing_version, chunk.meeting_id, chunk.repo,
+             chunk.file_path, chunk.page, chunk.document_title,
+             chunk.ocr_confidence, emb_full.astype(np.float32).tobytes()))
         chunk_id = cur.lastrowid
         chunk.chunk_id = chunk_id
         self.db.execute(
@@ -260,11 +296,12 @@ class MemoryStore:
              chunk_id, memory_id, json.dumps(list(char_span))))
 
     def add_relation(self, memory_id: str, subject: str, predicate: str,
-                     object_: str, valid_at: int | None = None):
-        self.db.execute(
+                     object_: str, valid_at: int | None = None, chunk_id: int | None = None) -> int:
+        cur = self.db.execute(
             """INSERT INTO relations(memory_id, subject, predicate, object,
-                 valid_at, transaction_at) VALUES (?,?,?,?,?,?)""",
-            (memory_id, subject, predicate, object_, valid_at, now_epoch()))
+                 valid_at, chunk_id, transaction_at) VALUES (?,?,?,?,?,?,?)""",
+            (memory_id, subject, predicate, object_, valid_at, chunk_id, now_epoch()))
+        return cur.lastrowid
 
     def append_history(self, memory_id: str, field: str, old_value, new_value):
         row = self.db.execute(
@@ -290,6 +327,14 @@ class MemoryStore:
     def get_chunk(self, chunk_id: int) -> sqlite3.Row | None:
         return self.db.execute(
             "SELECT * FROM chunks WHERE chunk_id=?", (chunk_id,)).fetchone()
+
+    def get_chunks_batch(self, chunk_ids: list[int]) -> dict[int, sqlite3.Row]:
+        if not chunk_ids:
+            return {}
+        marks = ",".join("?" * len(chunk_ids))
+        rows = self.db.execute(
+            f"SELECT * FROM chunks WHERE chunk_id IN ({marks})", chunk_ids).fetchall()
+        return {r["chunk_id"]: r for r in rows}
 
     def neighbor_chunks(self, chunk: sqlite3.Row) -> list[sqlite3.Row]:
         return self.db.execute(
@@ -422,13 +467,13 @@ class MemoryStore:
         """Relation traversal: entities as subject/object -> owning memories' chunks."""
         if not entities:
             return []
-        likes, params = [], []
+        conds, params = [], []
         for e in entities:
-            likes.append("(lower(r.subject) LIKE ? OR lower(r.object) LIKE ?)")
-            params.extend([f"%{e.lower()}%", f"%{e.lower()}%"])
+            conds.append("(lower(r.subject) = ? OR lower(r.object) = ?)")
+            params.extend([e.lower(), e.lower()])
         rows = self.db.execute(
             f"""SELECT r.memory_id, count(*) AS hits FROM relations r
-                WHERE ({' OR '.join(likes)}) AND r.invalid_at IS NULL
+                WHERE ({' OR '.join(conds)}) AND r.invalid_at IS NULL
                 GROUP BY r.memory_id ORDER BY hits DESC LIMIT 10""",
             params).fetchall()
         out: list[tuple[int, float]] = []
@@ -473,12 +518,33 @@ class MemoryStore:
         self.db.execute(f"DELETE FROM episodes WHERE episode_id IN ({marks})",
                         list(ep_ids))
         for mid in mem_ids:
+            self.db.execute(
+                "DELETE FROM relations WHERE memory_id=? AND valid_at BETWEEN ? AND ?",
+                (mid, t_from, t_to))
             self.append_history(mid, "forget",
                                 f"episodes {t_from}-{t_to}", "erased")
+        self.db.execute("DELETE FROM okf WHERE source_type='meeting' AND source_key=?", (meeting_id,))
+        self.db.execute("DELETE FROM summaries WHERE level='meeting' AND scope_key=?", (meeting_id,))
         self.commit()
         return {"episodes": len(ep_ids), "chunks": len(chunk_ids)}
 
     def forget_memory(self, memory_id: str) -> dict:
+        mem = self.get_memory(memory_id)
+        if mem:
+            source_type = mem["source_type"]
+            meta = json.loads(mem["source_meta"] or "{}")
+            if source_type == "meeting":
+                mid = meta.get("meeting_id") or memory_id
+                self.db.execute("DELETE FROM okf WHERE source_type='meeting' AND source_key=?", (mid,))
+                self.db.execute("DELETE FROM summaries WHERE level='meeting' AND scope_key=?", (mid,))
+            elif source_type == "github_repo":
+                repo = meta.get("repo")
+                if repo:
+                    self.db.execute("DELETE FROM okf WHERE source_type='github_repo' AND source_key=?", (repo,))
+            elif source_type == "pdf":
+                title = mem["title"]
+                self.db.execute("DELETE FROM okf WHERE source_type='pdf' AND source_key=?", (title,))
+
         chunk_ids = [r["chunk_id"] for r in self.db.execute(
             "SELECT chunk_id FROM chunks WHERE memory_id=?", (memory_id,))]
         self._delete_chunks(chunk_ids)

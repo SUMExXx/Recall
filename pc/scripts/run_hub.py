@@ -1,13 +1,14 @@
-"""Dev launcher: seed a demo DB if empty, then serve the hub.
+"""Hub launcher.
 
 Usage:
-  python scripts/run_hub.py [--db demo_hub.db] [--port 8000] [--no-seed]
+  python scripts/run_hub.py [--db demo_hub.db] [--port 8000] [--seed]
                             [--backend ollama|npu|hash]
 
-The backend defaults to RECALL_BACKEND (npu). On your laptop run with
-`--backend ollama` (Ollama running) or `--backend hash` (fully offline).
+Starts EMPTY by default — pass --seed to load the sample cross-source demo
+data. Backend defaults to RECALL_BACKEND (pc/.env).
 """
 import argparse
+import logging
 import os
 import sys
 
@@ -20,7 +21,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--db", default="demo_hub.db")
     ap.add_argument("--port", type=int, default=8000)
-    ap.add_argument("--no-seed", action="store_true")
+    ap.add_argument("--seed", action="store_true",
+                    help="seed the sample demo data (default: start empty)")
     ap.add_argument("--backend", default=None, choices=["npu", "ollama", "hash"],
                     help="override RECALL_BACKEND for this run")
     args = ap.parse_args()
@@ -34,7 +36,12 @@ def main():
     from recall_memory.config import RecallConfig
     cfg = RecallConfig(db_path=args.db)
 
-    if not args.no_seed:
+    logging.basicConfig(
+        level=getattr(logging, cfg.log_level.upper(), logging.INFO),
+        format="%(asctime)s %(levelname).1s %(name)s  %(message)s",
+        datefmt="%H:%M:%S")
+
+    if args.seed:
         from recall_memory.demo_data import seed
         from recall_memory.ingest import Ingestor
         from recall_memory.store import MemoryStore
@@ -51,14 +58,33 @@ def main():
     print(f"""
 Recall PC Hub
   backend    {cfg.backend}   (RECALL_BACKEND / pc/.env)
-  db         {args.db}
+  db         {args.db}{'' if args.seed else '   (empty start — use --seed for demo data)'}
   asr        {asr_how}
+  dream      consolidation every {cfg.consolidate_every_s:.0f}s (idle Dream tier)
   dashboard  http://localhost:{args.port}
   mic        http://localhost:{args.port}/capture
 """)
 
     import uvicorn
-    uvicorn.run("hub.app:app", host="127.0.0.1", port=args.port)
+    # SINGLE process — do not set workers=N. This was set back to 3 and is the
+    # confirmed root cause of the duplicate/overlapping dream_tier runs and
+    # trace-id resets seen in the trace log (each worker is a separate process
+    # with its OWN HubState: its own `_last_dream`/`_dream_stats`, its own
+    # in-memory trace sequence counter, its own WS connection set). Concretely,
+    # with workers=3 you get three independent supervisor loops, each
+    # deciding on its own schedule to run the Dream tier against the SAME
+    # sqlite file — hence two consolidations of the same meeting ~1s apart.
+    # It also reproduces the earlier "database is locked" crash (two writers)
+    # and silently drops events (a WS client's socket lives on one worker;
+    # captures on another worker never reach it without a reload).
+    # Heavy work (ASR, embed, ingest, Dream tier) is already offloaded to
+    # background threads inside this ONE process, so the event loop never
+    # blocks — there is no concurrency upside to more worker processes here,
+    # only shared-state bugs. If you need to scale request handling, that has
+    # to go through a shared store (Postgres) + a shared pub/sub for the WS
+    # fabric first; don't set workers>1 on this app before that exists.
+    uvicorn.run("hub.app:app", host="127.0.0.1", port=args.port,
+                log_level=cfg.log_level.lower())
 
 
 if __name__ == "__main__":

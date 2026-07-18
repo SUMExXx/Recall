@@ -31,7 +31,8 @@ class OllamaEmbedder:
         import requests
         resp = requests.post(
             f"{self.url}/api/embed",
-            json={"model": self.model, "input": texts},
+            # keep_alive: keep the model resident — a cold reload adds seconds
+            json={"model": self.model, "input": texts, "keep_alive": "30m"},
             timeout=120,
         )
         resp.raise_for_status()
@@ -64,15 +65,64 @@ class OllamaLLM:
             return False
 
     def generate(self, prompt: str, *, json: bool = False,
-                 timeout: float = 180.0) -> str:
+                 schema: dict | None = None, timeout: float = 180.0) -> str:
         import requests
         body = {"model": self.model, "stream": False,
+                "keep_alive": "30m",              # no cold reload between asks
+                "options": {"num_predict": 320},  # cited answers, bounded latency
+                # think=False: some Ollama models (e.g. "thinking"-capable
+                # Gemma builds) spend their ENTIRE num_predict budget on
+                # hidden reasoning tokens and stop at the cap before ever
+                # emitting the actual answer — content comes back empty,
+                # done_reason="length". Confirmed directly against gemma4:
+                # with thinking on, a trivial tier-3 planner call burned all
+                # 320 tokens reasoning about "hi" and returned "". Ignored by
+                # models that don't support toggling it.
+                "think": False,
                 "messages": [{"role": "user", "content": prompt}]}
-        if json:
+        if schema is not None:
+            # Ollama grammar-constrains generation to this JSON schema —
+            # including any `enum` fields — so a small model literally
+            # cannot emit an out-of-set value (no more echoing a pipe-joined
+            # placeholder like "meeting|code|decision|timeline|general" back
+            # verbatim; that string isn't a legal value under the schema).
+            body["format"] = schema
+        elif json:
             body["format"] = "json"
         r = requests.post(f"{self.url}/api/chat", json=body, timeout=timeout)
         r.raise_for_status()
         return r.json()["message"]["content"].strip()
+
+
+class LocalTransformersReranker:
+    """Local CPU/GPU cross-encoder reranker using Hugging Face sentence-transformers.
+    Selected when RECALL_RERANKER_MODEL is configured and sentence-transformers is installed.
+    """
+    name = "bge-reranker-local"
+
+    def __init__(self, model_name: str = "BAAI/bge-reranker-v2-m3"):
+        self.model_name = model_name
+        self._model = None
+
+    def _load(self):
+        if self._model is None:
+            from sentence_transformers import CrossEncoder
+            import torch
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            self._model = CrossEncoder(self.model_name, device=device)
+        return self._model
+
+    def rerank(self, query: str,
+               candidates: list[tuple[int, float, str]]) -> list[tuple[int, float]]:
+        if not candidates:
+            return []
+        model = self._load()
+        pairs = [[query, text] for _, _, text in candidates]
+        scores = model.predict(pairs)
+        # Sort candidates by the predicted scores descending
+        scored = [(candidates[i][0], float(scores[i])) for i in range(len(candidates))]
+        scored.sort(key=lambda t: -t[1])
+        return scored
 
 
 class OllamaBackend(Backend):
@@ -88,9 +138,21 @@ class OllamaBackend(Backend):
 
     @cached_property
     def reranker(self):
+        import os
+        import logging
+        log = logging.getLogger("recall.backends.ollama")
+        model_name = os.environ.get("RECALL_RERANKER_MODEL")
+        if model_name:
+            try:
+                import sentence_transformers
+                return LocalTransformersReranker(model_name)
+            except ImportError:
+                log.warning("RECALL_RERANKER_MODEL is set but sentence-transformers is not installed. "
+                            "Please run: pip install sentence-transformers")
         return PassthroughReranker()
 
     @cached_property
     def tokenizer(self):
         from ..tokenizer import ModelTokenizer
         return ModelTokenizer(self.cfg.npu_tokenizer_id)
+

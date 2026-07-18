@@ -8,6 +8,8 @@ __pycache__
 *.egg-info
 build/
 dist/
+logs/
+*.log
 # on-device model binaries (see pc/models/README.md)
 pc/models/*.onnx
 pc/models/*.bin
