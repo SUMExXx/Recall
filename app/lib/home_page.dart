@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 
 import 'util/audio_util.dart';
+import 'chat_store.dart';
 import 'memory_pipeline.dart';
 import 'pipeline/vector_store.dart';
 
@@ -30,9 +31,12 @@ class _HomePageState extends State<HomePage> {
   bool _needsSetup = false; // first run: no speaker enrolled yet
   bool _recording = false;
   bool _asking = false;
-  String? _answer;
   StreamSubscription<String>? _syncSub;
   String _syncStatus = '';
+
+  ChatStore? _chat;
+  final List<ChatMessage> _messages = [];
+  final _chatScroll = ScrollController();
 
   @override
   void initState() {
@@ -47,6 +51,9 @@ class _HomePageState extends State<HomePage> {
       _memorySub = pipe.onMemory.listen((_) => _refresh());
       _syncSub = pipe.syncStatus.listen((s) => setState(() => _syncStatus = s));
       _pipe = pipe;
+      _chat = await ChatStore.create();
+      final history = await _chat!.history();
+      setState(() => _messages.addAll(history));
       final speakers = await pipe.enrolledSpeakers();
       setState(() {
         _status = 'Idle';
@@ -122,26 +129,55 @@ class _HomePageState extends State<HomePage> {
 
   Future<void> _askQuestion() async {
     final q = _askController.text.trim();
-    if (q.isEmpty) return;
+    if (q.isEmpty || _asking) return;
     FocusScope.of(context).unfocus();
+    _askController.clear();
+
+    final userMsg = await _chat!.add(ChatMessage(
+      timestamp: DateTime.now(),
+      fromUser: true,
+      text: q,
+    ));
     setState(() {
+      _messages.add(userMsg);
       _asking = true;
-      _answer = null;
     });
+    _scrollToBottom();
+
+    String answer;
     try {
-      final answer = await _pipe!.ask(q);
-      if (!mounted) return;
-      setState(() {
-        _asking = false;
-        _answer = answer;
-      });
+      answer = await _pipe!.ask(q);
     } catch (e) {
-      if (!mounted) return;
-      setState(() {
-        _asking = false;
-        _answer = 'Error: $e';
-      });
+      answer = 'Error: $e';
     }
+    if (!mounted) return;
+
+    final botMsg = await _chat!.add(ChatMessage(
+      timestamp: DateTime.now(),
+      fromUser: false,
+      text: answer,
+    ));
+    setState(() {
+      _messages.add(botMsg);
+      _asking = false;
+    });
+    _scrollToBottom();
+  }
+
+  void _scrollToBottom() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!_chatScroll.hasClients) return;
+      _chatScroll.animateTo(
+        _chatScroll.position.maxScrollExtent,
+        duration: const Duration(milliseconds: 250),
+        curve: Curves.easeOut,
+      );
+    });
+  }
+
+  Future<void> _clearChat() async {
+    await _chat!.clear();
+    setState(() => _messages.clear());
   }
 
   Future<void> _syncSettings() async {
@@ -300,6 +336,8 @@ class _HomePageState extends State<HomePage> {
     _queryController.dispose();
     _nameController.dispose();
     _askController.dispose();
+    _chatScroll.dispose();
+    _chat?.dispose();
     _pipe?.dispose();
     super.dispose();
   }
@@ -361,6 +399,11 @@ class _HomePageState extends State<HomePage> {
               onPressed: _enroll,
               icon: const Icon(Icons.person_add),
             ),
+            IconButton(
+              tooltip: 'Clear chat',
+              onPressed: _messages.isEmpty ? null : _clearChat,
+              icon: const Icon(Icons.delete_sweep),
+            ),
           ],
           bottom: const TabBar(
             tabs: [
@@ -384,50 +427,98 @@ class _HomePageState extends State<HomePage> {
   Widget _buildAsk() {
     return Column(
       children: [
-        Padding(
-          padding: const EdgeInsets.all(16),
-          child: Row(
-            children: [
-              Expanded(
-                child: TextField(
-                  controller: _askController,
-                  textInputAction: TextInputAction.send,
-                  onSubmitted: (_) => _askQuestion(),
-                  decoration: const InputDecoration(
-                    hintText: 'Ask about your memories…',
-                    border: OutlineInputBorder(),
-                    isDense: true,
+        Expanded(
+          child: _messages.isEmpty && !_asking
+              ? const Center(
+                  child: Padding(
+                    padding: EdgeInsets.all(24),
+                    child: Text(
+                      'Ask a question and Recall will answer from your memories.',
+                      textAlign: TextAlign.center,
+                    ),
                   ),
+                )
+              : ListView.builder(
+                  controller: _chatScroll,
+                  padding: const EdgeInsets.fromLTRB(12, 12, 12, 12),
+                  itemCount: _messages.length + (_asking ? 1 : 0),
+                  itemBuilder: (context, i) {
+                    if (i == _messages.length) return _buildTyping();
+                    return _buildBubble(_messages[i]);
+                  },
                 ),
-              ),
-              const SizedBox(width: 8),
-              IconButton.filled(
-                onPressed: _asking ? null : _askQuestion,
-                icon: const Icon(Icons.send),
-              ),
-            ],
-          ),
         ),
         const Divider(height: 1),
-        Expanded(
-          child: _asking
-              ? const Center(child: CircularProgressIndicator())
-              : _answer == null
-                  ? const Center(
-                      child: Padding(
-                        padding: EdgeInsets.all(24),
-                        child: Text(
-                          'Ask a question and Recall will answer from your memories.',
-                          textAlign: TextAlign.center,
-                        ),
-                      ),
-                    )
-                  : SingleChildScrollView(
-                      padding: const EdgeInsets.fromLTRB(16, 8, 16, 88),
-                      child: SelectableText(_answer!),
+        SafeArea(
+          top: false,
+          child: Padding(
+            padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
+            child: Row(
+              children: [
+                Expanded(
+                  child: TextField(
+                    controller: _askController,
+                    textInputAction: TextInputAction.send,
+                    onSubmitted: (_) => _askQuestion(),
+                    minLines: 1,
+                    maxLines: 4,
+                    decoration: const InputDecoration(
+                      hintText: 'Ask about your memories…',
+                      border: OutlineInputBorder(),
+                      isDense: true,
                     ),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                IconButton.filled(
+                  onPressed: _asking ? null : _askQuestion,
+                  icon: const Icon(Icons.send),
+                ),
+              ],
+            ),
+          ),
         ),
       ],
+    );
+  }
+
+  Widget _buildBubble(ChatMessage m) {
+    final scheme = Theme.of(context).colorScheme;
+    final bg = m.fromUser ? scheme.primary : scheme.surfaceContainerHighest;
+    final fg = m.fromUser ? scheme.onPrimary : scheme.onSurface;
+    return Align(
+      alignment: m.fromUser ? Alignment.centerRight : Alignment.centerLeft,
+      child: Container(
+        margin: const EdgeInsets.symmetric(vertical: 4),
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+        constraints: BoxConstraints(
+          maxWidth: MediaQuery.of(context).size.width * 0.78,
+        ),
+        decoration: BoxDecoration(
+          color: bg,
+          borderRadius: BorderRadius.circular(16),
+        ),
+        child: SelectableText(m.text, style: TextStyle(color: fg)),
+      ),
+    );
+  }
+
+  Widget _buildTyping() {
+    return Align(
+      alignment: Alignment.centerLeft,
+      child: Container(
+        margin: const EdgeInsets.symmetric(vertical: 4),
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+        decoration: BoxDecoration(
+          color: Theme.of(context).colorScheme.surfaceContainerHighest,
+          borderRadius: BorderRadius.circular(16),
+        ),
+        child: const SizedBox(
+          width: 20,
+          height: 20,
+          child: CircularProgressIndicator(strokeWidth: 2),
+        ),
+      ),
     );
   }
 
