@@ -303,6 +303,9 @@ class MemoryStore:
             (memory_id, subject, predicate, object_, valid_at, chunk_id, now_epoch()))
         return cur.lastrowid
 
+    def update_chunk_title(self, chunk_id: int, title: str):
+        self.db.execute("UPDATE chunks SET title=? WHERE chunk_id=?", (title, chunk_id))
+
     def append_history(self, memory_id: str, field: str, old_value, new_value):
         row = self.db.execute(
             "SELECT history FROM memories WHERE memory_id=?", (memory_id,)).fetchone()

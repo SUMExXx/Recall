@@ -8,6 +8,11 @@ import pytest
 
 os.environ["RECALL_DB_PATH"] = ":memory:"
 os.environ["RECALL_BACKEND"] = "hash"
+# Hermetic regardless of the developer's local pc/.env: cloud_optin=True there
+# would otherwise make flush_audio's now-primary Sarvam path attempt REAL
+# network calls in tests that don't explicitly mock sarvam_cloud (every test
+# exercising WS audio ingest does, since Sarvam is tried first when allowed).
+os.environ["RECALL_CLOUD_OPTIN"] = "false"
 
 import anyio
 from fastapi.testclient import TestClient
@@ -142,6 +147,70 @@ def test_sarvam_provider_parses_real_rest_contract(monkeypatch):
     assert captured["timeout"] == 3.0
 
 
+# ----------------------------------------------------------- sarvam tts
+
+def test_sarvam_tts_no_key_raises_without_network_call():
+    from hub.tts import SarvamTTSProvider
+    p = SarvamTTSProvider(api_key="")
+    with pytest.raises(RuntimeError, match="RECALL_SARVAM_API_KEY"):
+        p.synthesize("hello")
+
+
+def test_sarvam_tts_rejects_empty_text():
+    from hub.tts import SarvamTTSProvider
+    p = SarvamTTSProvider(api_key="test-key")
+    with pytest.raises(ValueError):
+        p.synthesize("   ")
+
+
+def test_sarvam_tts_parses_real_rest_contract(monkeypatch):
+    """docs.sarvam.ai/api-reference/text-to-speech/convert: POST
+    api.sarvam.ai/text-to-speech, header api-subscription-key, JSON body
+    text/target_language_code/model/speaker, response {"audios": [b64]}."""
+    from hub.tts import SarvamTTSProvider
+    import base64
+    import requests
+    captured = {}
+    raw_audio = b"RIFF....WAVEfmt fake-wav-bytes"
+
+    class FakeResp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"audios": [base64.b64encode(raw_audio).decode()]}
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        captured.update(url=url, headers=headers, body=json, timeout=timeout)
+        return FakeResp()
+    monkeypatch.setattr(requests, "post", fake_post)
+    p = SarvamTTSProvider(api_key="test-key", model="bulbul:v3", speaker="anushka",
+                         language_code="en-IN", timeout=15.0)
+    audio = p.synthesize("Hello there")
+    assert audio == raw_audio
+    assert captured["url"] == "https://api.sarvam.ai/text-to-speech"
+    assert captured["headers"]["api-subscription-key"] == "test-key"
+    assert captured["body"]["text"] == "Hello there"
+    assert captured["body"]["target_language_code"] == "en-IN"
+    assert captured["body"]["model"] == "bulbul:v3"
+    assert captured["timeout"] == 15.0
+
+
+def test_tts_endpoint_requires_cloud_optin(client, state):
+    r = client.post("/tts", json={"text": "hello"})
+    assert r.status_code == 403
+
+
+def test_tts_endpoint_returns_audio_when_allowed(client, state, monkeypatch):
+    state.policy.update(cloud_optin=True)
+    monkeypatch.setattr(state.tts, "synthesize",
+                        lambda text, **kw: b"fake-audio-bytes")
+    r = client.post("/tts", json={"text": "hello there"})
+    assert r.status_code == 200
+    assert r.content == b"fake-audio-bytes"
+    assert r.headers["content-type"] == "audio/wav"
+
+
 # ------------------------------------------------------------ proactive
 
 def test_proactive_fires_once_with_cooldown():
@@ -201,7 +270,7 @@ def test_rest_ask_and_forget_flow(client, state):
     seed(state.ingestor)
     out = client.post("/ask", json={"query": "Who decided to use JWT?"}).json()
     assert out["sources"], "ask must return sources"
-    assert out["plan"]["query_type"] == "decision"
+    assert out["plan"]["query_type"] == "general"   # no more per-query classification
     assert all(s["chunk_title"] for s in out["sources"])
     dump = client.get("/dump").json()
     assert len(dump) == 5
@@ -215,6 +284,26 @@ def test_rest_consolidate(client, state):
     seed(state.ingestor)
     out = client.post("/consolidate").json()
     assert out["dualmic_merged"] == 1
+
+
+def test_led_auto_resets_to_idle_after_delay(state):
+    """The dashboard LED must not stay lit "recalled"/"error" forever — it
+    was found stuck on green after an /ask completed, since nothing ever
+    reset it back to idle."""
+    async def _run():
+        await state.set_led("recalled", reset_after=0.01)
+        await anyio.sleep(0.05)
+        return state.led_state
+    assert anyio.run(_run) == "idle"
+
+
+def test_led_auto_reset_does_not_clobber_a_newer_state(state):
+    async def _run():
+        await state.set_led("recalled", reset_after=0.01)
+        await state.set_led("capturing")   # something newer happened meanwhile
+        await anyio.sleep(0.05)
+        return state.led_state
+    assert anyio.run(_run) == "capturing"
 
 
 # -------------------------------------------------------------- WS layer
@@ -351,23 +440,23 @@ def test_ws_audio_ingest(client, state, monkeypatch):
     assert "hello from audio" in sess_mem["content"]
 
 
-def test_flush_audio_routes_indic_to_sarvam_when_cloud_allowed(client, state,
+def test_flush_audio_uses_sarvam_as_primary_when_cloud_allowed(client, state,
                                                                monkeypatch):
-    """Bug: sarvam_cloud existed but flush_audio hardcoded lang='en' when
-    calling the old selection helper, so it could never be selected. Local
-    Whisper's own language ID must now gate a Sarvam attempt for Indic audio
-    when the user has opted into cloud."""
+    """Sarvam is now the PRIMARY STT whenever cloud is opted in — no local
+    Whisper call, no language pre-detection needed first."""
     from hub.asr import ASRResult
-    monkeypatch.setattr(
-        state.asr_providers["whisper_local"], "transcribe",
-        lambda payload: ASRResult(text="namaste duniya", lang="hi", confidence=0.5))
+
+    def must_not_be_called(payload):
+        raise AssertionError("whisper_local must not run when Sarvam succeeds")
+    monkeypatch.setattr(state.asr_providers["whisper_local"], "transcribe",
+                        must_not_be_called)
     monkeypatch.setattr(
         state.asr_providers["sarvam_cloud"], "transcribe",
-        lambda payload: ASRResult(text="namaste duniya (sarvam)", lang="hi-IN",
+        lambda payload: ASRResult(text="hello from sarvam", lang="en-IN",
                                   confidence=0.95))
     state.policy.update(cloud_optin=True)
     with client.websocket_connect("/ws") as ws:
-        ws.send_text(json.dumps({"type": "hello", "device_id": "indic-cap",
+        ws.send_text(json.dumps({"type": "hello", "device_id": "sarvam-cap",
                                  "role": "phone"}))
         json.loads(ws.receive_text()); json.loads(ws.receive_text())
         ws.send_text(json.dumps({"type": "meeting_start",
@@ -377,22 +466,19 @@ def test_flush_audio_routes_indic_to_sarvam_when_cloud_allowed(client, state,
         evt = json.loads(ws.receive_text())
         while evt.get("topic") != "transcript":
             evt = json.loads(ws.receive_text())
-        assert evt["data"]["text"] == "namaste duniya (sarvam)"
+        assert evt["data"]["text"] == "hello from sarvam"
         ws.send_text(json.dumps({"type": "meeting_end"}))
         while json.loads(ws.receive_text()).get("type") != "meeting_ended":
             pass
 
 
-def test_flush_audio_skips_sarvam_when_cloud_not_opted_in(client, state,
-                                                          monkeypatch):
+def test_flush_audio_falls_back_to_whisper_when_cloud_not_opted_in(client, state,
+                                                                   monkeypatch):
     from hub.asr import ASRResult
     monkeypatch.setattr(
         state.asr_providers["whisper_local"], "transcribe",
-        lambda payload: ASRResult(text="namaste duniya", lang="hi", confidence=0.5))
-    monkeypatch.setattr(
-        state.asr_providers["hinglish_local"], "transcribe",
-        lambda payload: ASRResult(text="namaste duniya (hinglish)", lang="hi",
-                                  confidence=0.8))
+        lambda payload: ASRResult(text="hello from whisper", lang="en",
+                                  confidence=0.9))
 
     def must_not_be_called(payload):
         raise AssertionError("sarvam_cloud must not run without cloud opt-in")
@@ -400,7 +486,7 @@ def test_flush_audio_skips_sarvam_when_cloud_not_opted_in(client, state,
                         must_not_be_called)
     # cloud_optin left at its default (False)
     with client.websocket_connect("/ws") as ws:
-        ws.send_text(json.dumps({"type": "hello", "device_id": "indic-cap2",
+        ws.send_text(json.dumps({"type": "hello", "device_id": "no-cloud-cap",
                                  "role": "phone"}))
         json.loads(ws.receive_text()); json.loads(ws.receive_text())
         ws.send_text(json.dumps({"type": "meeting_start",
@@ -410,7 +496,38 @@ def test_flush_audio_skips_sarvam_when_cloud_not_opted_in(client, state,
         evt = json.loads(ws.receive_text())
         while evt.get("topic") != "transcript":
             evt = json.loads(ws.receive_text())
-        assert evt["data"]["text"] == "namaste duniya (hinglish)"
+        assert evt["data"]["text"] == "hello from whisper"
+        ws.send_text(json.dumps({"type": "meeting_end"}))
+        while json.loads(ws.receive_text()).get("type") != "meeting_ended":
+            pass
+
+
+def test_flush_audio_falls_back_to_whisper_on_sarvam_failure(client, state,
+                                                              monkeypatch):
+    """Cloud is opted in but Sarvam errors (network/timeout) — local Whisper
+    must still produce a transcript rather than silently dropping the audio."""
+    from hub.asr import ASRResult
+
+    def boom(payload):
+        raise RuntimeError("simulated network failure")
+    monkeypatch.setattr(state.asr_providers["sarvam_cloud"], "transcribe", boom)
+    monkeypatch.setattr(
+        state.asr_providers["whisper_local"], "transcribe",
+        lambda payload: ASRResult(text="whisper saved the day", lang="en",
+                                  confidence=0.9))
+    state.policy.update(cloud_optin=True)
+    with client.websocket_connect("/ws") as ws:
+        ws.send_text(json.dumps({"type": "hello", "device_id": "sarvam-fail-cap",
+                                 "role": "phone"}))
+        json.loads(ws.receive_text()); json.loads(ws.receive_text())
+        ws.send_text(json.dumps({"type": "meeting_start",
+                                 "capture_device": "mobile"}))
+        [json.loads(ws.receive_text()) for _ in range(2)]
+        ws.send_bytes(b"\x00\x00" * (16000 * 4))
+        evt = json.loads(ws.receive_text())
+        while evt.get("topic") != "transcript":
+            evt = json.loads(ws.receive_text())
+        assert evt["data"]["text"] == "whisper saved the day"
         ws.send_text(json.dumps({"type": "meeting_end"}))
         while json.loads(ws.receive_text()).get("type") != "meeting_ended":
             pass
@@ -480,6 +597,21 @@ def test_communities_endpoint(client, state):
     out = client.get("/communities").json()
     assert out and {"community_id", "label", "members"} <= set(out[0])
     assert len(out[0]["members"]) >= 2                # JWT bridges the sources
+
+
+def test_memory_detail_endpoint_returns_full_content(client, state):
+    """The constellation dot-click view needs the FULL captured content, not
+    just the auto-generated title `/dump` returns — this is the on-demand
+    detail fetch that backs it."""
+    seed(state.ingestor)
+    dump = client.get("/dump").json()
+    mid = dump[0]["memory_id"]
+    detail = client.get(f"/memory/{mid}").json()
+    assert detail["memory_id"] == mid
+    assert detail["content"]              # the full raw transcript/text
+    assert "title" in detail and "summary" in detail
+    assert isinstance(detail["chunks"], list) and detail["chunks"]
+    assert client.get("/memory/does-not-exist").status_code == 404
 
 
 # ------------------------------------------------------------ MCP server

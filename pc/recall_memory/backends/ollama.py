@@ -6,18 +6,24 @@ API, so the exact same engine code runs against it. Selected with
 
   Embedder  nomic-embed-text (768-dim; search_document:/search_query: prefixes)
   LLM       llama3.2:3b (chat, JSON mode)   — stands in for Qwen3-4B
-  Reranker  passthrough (no cross-encoder locally)
+  Reranker  BAAI/bge-reranker-v2-m3 via sentence-transformers, GPU-accelerated
+            if available, when RECALL_RERANKER_MODEL is set — else passthrough
+            (Ollama itself has no rerank endpoint to fall back to)
   Tokenizer the real Qwen tokenizer (HF) so token windows match the NPU
 """
 from __future__ import annotations
 
+import logging
 from functools import cached_property
 
 import numpy as np
 
 from ..config import DIM_FULL, RecallConfig
 from ..embeddings import DOC_PREFIX, QUERY_PREFIX, _normalize
+from ..tracing import step
 from .base import Backend, PassthroughReranker
+
+log = logging.getLogger("recall.backends.ollama")
 
 
 class OllamaEmbedder:
@@ -109,19 +115,25 @@ class LocalTransformersReranker:
             from sentence_transformers import CrossEncoder
             import torch
             device = "cuda" if torch.cuda.is_available() else "cpu"
+            log.info("loading %s onto %s (first call downloads the model)…",
+                    self.model_name, device)
             self._model = CrossEncoder(self.model_name, device=device)
+            log.info("%s ready on %s", self.model_name, device)
         return self._model
 
     def rerank(self, query: str,
                candidates: list[tuple[int, float, str]]) -> list[tuple[int, float]]:
         if not candidates:
             return []
-        model = self._load()
-        pairs = [[query, text] for _, _, text in candidates]
-        scores = model.predict(pairs)
-        # Sort candidates by the predicted scores descending
-        scored = [(candidates[i][0], float(scores[i])) for i in range(len(candidates))]
-        scored.sort(key=lambda t: -t[1])
+        with step("rerank:cross_encoder", model=self.model_name,
+                  candidates=len(candidates)) as s:
+            model = self._load()
+            pairs = [[query, text] for _, _, text in candidates]
+            scores = model.predict(pairs)
+            scored = [(candidates[i][0], float(scores[i]))
+                     for i in range(len(candidates))]
+            scored.sort(key=lambda t: -t[1])
+            s.detail(device=str(model.model.device))
         return scored
 
 
@@ -138,17 +150,19 @@ class OllamaBackend(Backend):
 
     @cached_property
     def reranker(self):
-        import os
         import logging
         log = logging.getLogger("recall.backends.ollama")
-        model_name = os.environ.get("RECALL_RERANKER_MODEL")
+        model_name = self.cfg.reranker_model
         if model_name:
             try:
-                import sentence_transformers
+                import sentence_transformers  # noqa: F401 — availability probe only
+                log.info("loading cross-encoder reranker %s (sentence-transformers)…",
+                        model_name)
                 return LocalTransformersReranker(model_name)
             except ImportError:
-                log.warning("RECALL_RERANKER_MODEL is set but sentence-transformers is not installed. "
-                            "Please run: pip install sentence-transformers")
+                log.warning("RECALL_RERANKER_MODEL=%s is set but sentence-transformers "
+                           "is not installed — falling back to passthrough. "
+                           'Run: pip install -e ".[rerank]"', model_name)
         return PassthroughReranker()
 
     @cached_property

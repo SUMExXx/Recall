@@ -66,8 +66,7 @@ class Retriever:
         self.embedder = self.backend.embedder
         self.reranker = reranker or self.backend.reranker
         self.llm = self.backend.llm
-        self.router = Router(store, self.cfg, embedder=self.embedder,
-                             llm=self.llm)
+        self.router = Router(store, self.cfg)
 
     # ------------------------------------------------------------ pipeline
 
@@ -87,9 +86,7 @@ class Retriever:
                 query_vec = self.embedder.embed_query(query)
                 s.detail(embedder=self.embedder.name, dim=int(query_vec.shape[0]))
         if plan is None:
-            plan = self.router.route(query, query_vec)
-        if plan.command:
-            return []  # tier-0 commands are handled by the caller, not retrieval
+            plan = self.router.route(query)
 
         needs, filters = plan.needs, plan.filters
         t0 = time.perf_counter()
@@ -108,7 +105,7 @@ class Retriever:
             with step("retrieve:entity_index", entities=plan.entities) as s:
                 route_lists["entity"] = self.store.entity_search(plan.entities, filters)
                 s.detail(hits=len(route_lists["entity"]))
-        if needs.get("metadata_filter") and (filters or plan.path == "fast"):
+        if needs.get("metadata_filter") and filters:
             with step("retrieve:metadata_filter", filters=filters) as s:
                 route_lists["metadata"] = self.store.metadata_search(filters)
                 s.detail(hits=len(route_lists["metadata"]))
@@ -252,16 +249,13 @@ class Retriever:
             query_vec = self.embedder.embed_query(query)
             s.detail(embedder=self.embedder.name)
         t_embed = time.perf_counter()
-        plan = self.router.route(query, query_vec)   # instruments its own steps
-        if plan.command:
-            return {"answer": None, "plan": plan, "contexts": [],
-                    "command": plan.command}
+        plan = self.router.route(query)   # instruments its own step
         # same trace, reuse query_vec — no redundant second embed call
         contexts = self._retrieve_impl(query, plan, top_k, query_vec=query_vec)
         t_retrieve = time.perf_counter()
         if not contexts:
-            log.info("ask %r: tier%d NOTFOUND (embed %.0f ms, retrieve %.0f ms)",
-                     query[:50], plan.tier, (t_embed - t0) * 1000,
+            log.info("ask %r: NOTFOUND (embed %.0f ms, retrieve %.0f ms)",
+                     query[:50], (t_embed - t0) * 1000,
                      (t_retrieve - t_embed) * 1000)
             return {"answer": "NOTFOUND — no matching memories.",
                     "plan": plan, "contexts": [], "okf": None}
@@ -269,8 +263,8 @@ class Retriever:
             okf = self._okf_for_contexts(contexts)
             s.detail(attached=okf is not None)
         answer = self._synthesize(query, contexts, okf)
-        log.info("ask %r: tier%d/%s · embed %.0f ms · retrieve %.0f ms · "
-                 "synth %.0f ms · %d ctx%s", query[:50], plan.tier,
+        log.info("ask %r: %s · embed %.0f ms · retrieve %.0f ms · "
+                 "synth %.0f ms · %d ctx%s", query[:50],
                  plan.query_type, (t_embed - t0) * 1000,
                  (t_retrieve - t_embed) * 1000,
                  (time.perf_counter() - t_retrieve) * 1000,
@@ -321,7 +315,7 @@ class Retriever:
                          + json.dumps(okf, ensure_ascii=False)[:1200] + "\n\n")
         prompt = (
             "You are Recall, an on-device memory assistant. Answer the question "
-            "using ONLY the memory excerpts below. Cite the [id:chunk] markers "
+            "using ONLY the memory excerpts below. Cite the source of each fact you use in your answer "
             "of the excerpts you used. If the excerpts do not contain the "
             "answer, reply exactly NOTFOUND.\n\n"
             f"{okf_block}MEMORY EXCERPTS:\n{context_str}\n\nQUESTION: {query}\nANSWER:")

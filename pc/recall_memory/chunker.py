@@ -31,20 +31,26 @@ _SENTENCE_END_RE = re.compile(r"[.!?](?:\s|$)")
 _SPEAKER_PREFIX_RE = re.compile(r"^([A-Za-z][\w\s]{0,30}?):\s+")
 
 
+def clip_title(t: str) -> str:
+    if len(t) > _TITLE_MAX_CHARS:
+        t = t[:_TITLE_MAX_CHARS - 1].rsplit(" ", 1)[0] + "…"
+    return t
+
+
 def _extractive_title(text: str) -> str:
     """A short, deterministic label from the CHUNK's own text — every chunk
     of a memory previously showed the same generic parent-memory title in
     citations/dashboard, making it impossible to tell which part of a long
     meeting a given hit actually came from. First clause, sentence-bounded
-    where cheap, speaker-label stripped for meetings, no LLM call."""
+    where cheap, speaker-label stripped for meetings, no LLM call. Used
+    immediately at ingest time; may be upgraded later by an async LLM title
+    (see ingest.py) once the backend has one available."""
     t = _SPEAKER_PREFIX_RE.sub("", text.strip(), count=1)
     m = _SENTENCE_END_RE.search(t)
     if m and m.start() >= 8:
         t = t[:m.start() + 1]
     t = " ".join(t.split())
-    if len(t) > _TITLE_MAX_CHARS:
-        t = t[:_TITLE_MAX_CHARS - 1].rsplit(" ", 1)[0] + "…"
-    return t
+    return clip_title(t)
 
 
 def _window_starts(n_tokens: int, spec: ChunkSpec) -> list[int]:

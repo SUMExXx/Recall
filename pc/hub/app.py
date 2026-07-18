@@ -8,9 +8,9 @@ WS protocol (JSON text messages, plus binary audio):
                   meeting_start{meeting_id?, title?, capture_device?}
                   utterance{text, speaker?, t_start?, t_end?, asr_confidence?}
                   <binary frame>  raw PCM16 mono 16 kHz audio; buffered ~4 s,
-                                  transcribed via the ASR worker (in-process
-                                  faster-whisper by default), then treated as
-                                  an utterance
+                                  transcribed via Sarvam (primary, when cloud
+                                  is opted in) or in-process faster-whisper
+                                  (fallback), then treated as an utterance
                   button{action: bookmark|forget_last, minutes?}
                   meeting_end{} | ask{query, request_id?}
   hub -> client : welcome{resume_token, seq, missed[]} | pong
@@ -38,7 +38,7 @@ from contextlib import asynccontextmanager
 
 import anyio
 import numpy as np
-from fastapi import (FastAPI, HTTPException, Query, WebSocket,
+from fastapi import (FastAPI, HTTPException, Query, Response, WebSocket,
                      WebSocketDisconnect)
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
@@ -58,6 +58,7 @@ from .policy import PolicyEngine
 from .proactive import ProactiveRecallEngine
 from .registry import DeviceRegistry
 from .sessions import SessionManager
+from .tts import SarvamTTSProvider
 
 log = logging.getLogger("recall.hub")
 
@@ -86,15 +87,19 @@ class ForgetRequest(BaseModel):
     last_minutes: float | None = Field(None, gt=0)
 
 
+class TtsRequest(BaseModel):
+    text: str = Field(..., min_length=1, max_length=2500)
+    language_code: str | None = None
+    speaker: str | None = None
+
+
 class PolicyUpdate(BaseModel):
     cloud_optin: bool | None = None
     default_privacy_tag: str | None = None
 
 
 class PlanInfo(BaseModel):
-    tier: int
     query_type: str
-    path: str
     weight_profile: str
     filters: dict = {}
 
@@ -111,7 +116,6 @@ class SourceItem(BaseModel):
 
 class AskResponse(BaseModel):
     answer: str | None = None
-    command: dict | None = None
     latency_ms: int = 0
     plan: PlanInfo | None = None
     sources: list[SourceItem] = []
@@ -176,6 +180,12 @@ class HubState:
                 language_code=cfg.sarvam_language_code, mode=cfg.sarvam_mode,
                 timeout=cfg.sarvam_timeout_s, endpoint=cfg.sarvam_endpoint),
         }
+        self.tts = SarvamTTSProvider(
+            api_key=cfg.sarvam_api_key, endpoint=cfg.sarvam_tts_endpoint,
+            model=cfg.sarvam_tts_model, speaker=cfg.sarvam_tts_speaker,
+            language_code=cfg.sarvam_tts_language_code,
+            sample_rate=cfg.sarvam_tts_sample_rate, codec=cfg.sarvam_tts_codec,
+            pace=cfg.sarvam_tts_pace, timeout=cfg.sarvam_tts_timeout_s)
         # WS fabric — keyed per CONNECTION, not per device_id: two tabs may
         # both hello as "dashboard", and a reconnect must not steal the event
         # stream from a socket that is still alive.
@@ -223,12 +233,19 @@ class HubState:
         if not any(e["device_id"] == device_id for e in self.sockets.values()):
             self.registry.disconnect(device_id)
 
-    async def set_led(self, state: str):
+    async def set_led(self, state: str, *, reset_after: float | None = None):
         if state not in LED_STATES:
             state = "error"
         if state != self.led_state:
             self.led_state = state
             await self.broadcast("led_state", {"state": state})
+        if reset_after is not None:
+            asyncio.create_task(self._reset_led_after(state, reset_after))
+
+    async def _reset_led_after(self, from_state: str, delay: float):
+        await asyncio.sleep(delay)
+        if self.led_state == from_state:   # nothing newer happened meanwhile
+            await self.set_led("idle")
 
     # ---------------------------------------------------------- utterance
 
@@ -271,13 +288,14 @@ class HubState:
                          privacy_tag: str | None = None):
         """Transcribe the device's buffered PCM16 audio via the ASR workers.
 
-        Selection (plan §2): local Whisper runs first — it's fast, free, and
-        already performs language ID as part of transcription, so there's no
-        need for a separate detection pass. If the DETECTED language is Indic
-        and the user has opted into cloud AND this content's privacy tag
-        allows it, prefer Sarvam's transcription for that segment (bounded by
-        `sarvam_timeout_s`; any failure keeps the local result). Falls to
-        HinglishLocal instead when cloud isn't allowed.
+        Selection: Sarvam is the PRIMARY STT whenever the user has opted into
+        cloud AND this content's privacy tag allows it (still fully
+        policy-gated — this sends audio off-device, the one place the
+        privacy-first design requires explicit opt-in; it is never bypassed).
+        `saaras:v3` with language_code="unknown" auto-detects and handles
+        English as well as the 10 Indic languages, so there's no need to
+        pre-detect language before deciding. Any Sarvam failure (network,
+        timeout, not opted in) falls back to local Whisper.
         """
         buf = self.audio_buffers.get(device_id)
         if not buf or len(buf) < min_bytes:
@@ -291,30 +309,18 @@ class HubState:
             # write happens off the event loop, same as everything else here.
             with ensure_trace("asr_transcribe", device_id=device_id,
                               audio_bytes=len(wav)), self.metrics.timer("asr"):
-                with step("asr:whisper_local"):
-                    local = self.asr_providers["whisper_local"].transcribe(
-                        {"audio": wav})
-                indic = local.lang in ("hi", "hi-en")
-                if not indic:
-                    return local
                 if self.policy.is_cloud_allowed(privacy_tag):
-                    with step("asr:sarvam_cloud", detected_lang=local.lang) as s:
+                    with step("asr:sarvam_cloud_primary") as s:
                         try:
                             cloud = self.asr_providers["sarvam_cloud"].transcribe(
                                 {"audio": wav})
-                            s.detail(used=True)
+                            s.detail(used=True, lang=cloud.lang)
                             return cloud
                         except Exception as e:
                             s.detail(used=False, error=str(e))
-                with step("asr:hinglish_local", detected_lang=local.lang) as s:
-                    try:
-                        hin = self.asr_providers["hinglish_local"].transcribe(
-                            {"audio": wav})
-                        s.detail(used=True)
-                        return hin
-                    except Exception as e:
-                        s.detail(used=False, error=str(e))
-                return local   # every Indic path failed — keep the local result
+                with step("asr:whisper_local_fallback"):
+                    return self.asr_providers["whisper_local"].transcribe(
+                        {"audio": wav})
         t0 = time.perf_counter()
         try:
             res = await anyio.to_thread.run_sync(_asr)
@@ -346,10 +352,9 @@ class HubState:
             plan = out["plan"]
             payload = {
                 "answer": out.get("answer"),
-                "command": out.get("command"),
                 "latency_ms": round((time.perf_counter() - t0) * 1000),
-                "plan": {"tier": plan.tier, "query_type": plan.query_type,
-                         "path": plan.path, "weight_profile": plan.weight_profile,
+                "plan": {"query_type": plan.query_type,
+                         "weight_profile": plan.weight_profile,
                          "filters": plan.filters},
                 "sources": [{"citation": c.citation(), "title": c.title,
                              "chunk_title": c.chunk_title,
@@ -358,14 +363,17 @@ class HubState:
                              "snippet": c.text[:200], "score": round(c.score, 3)}
                             for c in out.get("contexts", [])],
             }
-            log.info("ask %r -> tier %d/%s, %d sources, %d ms", query[:60],
-                     plan.tier, plan.query_type, len(payload["sources"]),
+            log.info("ask %r -> %s, %d sources, %d ms", query[:60],
+                     plan.query_type, len(payload["sources"]),
                      payload["latency_ms"])
-            await self.set_led("recalled" if payload["sources"] else "idle")
+            if payload["sources"]:
+                await self.set_led("recalled", reset_after=5.0)
+            else:
+                await self.set_led("idle")
             return payload
         except Exception as e:
             log.exception("ask failed: %r", query[:60])
-            await self.set_led("error")
+            await self.set_led("error", reset_after=5.0)
             return {"error": str(e),
                     "latency_ms": round((time.perf_counter() - t0) * 1000)}
 
@@ -437,7 +445,7 @@ async def maybe_dream(s: HubState):
 
 async def warmup():
     """Pre-load the hot path so the FIRST ask isn't seconds of cold start:
-    embedder graph, tier-2 router prototypes, and the LLM weights."""
+    embedder graph and the LLM weights."""
     s = get_state()
 
     def _warm() -> dict:
@@ -449,10 +457,6 @@ async def warmup():
                     s.retriever.embedder.embed_query("warmup")
                     report["embed_ms"] = round((time.perf_counter() - t0) * 1000)
                     st.detail(ms=report["embed_ms"])
-                    t0 = time.perf_counter()
-                    s.retriever.router._prototypes()
-                    report["prototypes_ms"] = round((time.perf_counter() - t0) * 1000)
-                    st.detail(prototypes_ms=report["prototypes_ms"])
                 except Exception as e:
                     report["embed"] = f"unavailable: {e}"
                     st.detail(error=str(e))
@@ -550,6 +554,30 @@ async def search_ep(body: SearchRequest):
                        snippet=c.text[:200]) for c in ctxs]
 
 
+@app.post("/tts")
+async def tts_ep(body: TtsRequest):
+    """Voice an answer via Sarvam Bulbul — policy-gated the same as Sarvam
+    STT (this sends text to a cloud API, the same privacy boundary)."""
+    s = get_state()
+    if not s.policy.is_cloud_allowed():
+        raise HTTPException(
+            status_code=403,
+            detail="cloud opt-in required for TTS — enable it via /policy")
+
+    def _synth():
+        with s.metrics.timer("tts"):
+            return s.tts.synthesize(body.text, language_code=body.language_code,
+                                    speaker=body.speaker)
+    try:
+        audio = await anyio.to_thread.run_sync(_synth)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"tts failed: {e}")
+    media_type = {"wav": "audio/wav", "mp3": "audio/mpeg",
+                 "opus": "audio/opus", "flac": "audio/flac",
+                 "aac": "audio/aac"}.get(s.cfg.sarvam_tts_codec, "application/octet-stream")
+    return Response(content=audio, media_type=media_type)
+
+
 @app.post("/forget")
 async def forget_ep(body: ForgetRequest):
     s = get_state()
@@ -585,6 +613,28 @@ async def dump_ep():
             """SELECT memory_id, source_type, title, created_at, importance,
                       archived FROM memories ORDER BY created_at DESC""").fetchall()
     return [dict(r) for r in rows]
+
+
+@app.get("/memory/{memory_id}")
+async def memory_detail_ep(memory_id: str):
+    """Full detail for one memory — the constellation dot-click view. `/dump`
+    deliberately omits `content` (bulk payload, fetched on every reload); this
+    is fetched lazily, once, only when a dot is actually clicked."""
+    s = get_state()
+    mem = s.store.get_memory(memory_id)
+    if mem is None:
+        raise HTTPException(status_code=404, detail="memory not found")
+    with s.store.lock:
+        chunks = s.store.db.execute(
+            """SELECT chunk_index, title, text FROM chunks
+               WHERE memory_id=? ORDER BY chunk_index""", (memory_id,)).fetchall()
+    return {
+        "memory_id": mem["memory_id"], "source_type": mem["source_type"],
+        "title": mem["title"], "content": mem["content"], "summary": mem["summary"],
+        "created_at": mem["created_at"], "importance": mem["importance"],
+        "chunks": [{"index": c["chunk_index"], "title": c["title"], "text": c["text"]}
+                   for c in chunks],
+    }
 
 
 @app.get("/links")

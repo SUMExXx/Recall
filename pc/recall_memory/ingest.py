@@ -8,19 +8,40 @@ entity_mentions, relations, metadata columns).
 from __future__ import annotations
 
 import logging
+import threading
 import time
 import numpy as np
 
 from .backends import get_backend
-from .chunker import build_transcript, chunk_document, chunk_meeting
+from .chunker import build_transcript, chunk_document, chunk_meeting, clip_title
 from .config import RecallConfig
 from .embeddings import matryoshka_coarse
 from .extractors import extract_decisions, extract_entities
+from .llm_validate import is_valid_llm_summary
 from .nmo import NMO, Chunk, Episode, new_id
 from .store import MemoryStore
 from .tracing import ensure_trace, step
 
 log = logging.getLogger("recall.ingest")
+
+_TITLE_PROMPT = (
+    "Write a short, specific title (5 words max, no quotes, no trailing "
+    "punctuation) for the note below. Reply with only the title.\n\nNote: {text}"
+)
+
+
+def _llm_chunk_title(llm, text: str) -> str | None:
+    """Ask the backend LLM for a better title than the extractive one. Returns
+    None (caller keeps the extractive title) on any failure or a low-quality
+    answer — never raises, this always runs off the capture path."""
+    try:
+        resp = llm.generate(_TITLE_PROMPT.format(text=text[:600]), timeout=15.0)
+    except Exception:
+        return None
+    title = " ".join(resp.strip().strip('"\'').split())
+    if not is_valid_llm_summary(title, text, min_chars=4, min_overlap=1):
+        return None
+    return clip_title(title)
 
 
 class Ingestor:
@@ -190,3 +211,29 @@ class Ingestor:
                  "in %.0f ms", nmo.source_type, nmo.title[:50],
                  nmo.memory_id[:8], len(chunks), len(episodes),
                  len(nmo.relations), (time.perf_counter() - t0) * 1000)
+
+        # Chunk dots must appear the instant this call returns (no Dream-tier
+        # wait) — so titles start as the extractive guess above and, only
+        # when this backend actually has an LLM, get upgraded a moment later
+        # by this fire-and-forget pass. Never blocks, never raises outward.
+        if chunks and self.backend.llm.available:
+            threading.Thread(target=self._refine_titles,
+                             args=(nmo.memory_id, list(chunks)), daemon=True).start()
+
+    def _refine_titles(self, memory_id: str, chunks: list[Chunk]):
+        llm = self.backend.llm
+        with ensure_trace("refine_titles", memory_id=memory_id):
+            for chunk in chunks:
+                with step("refine_title", chunk_id=chunk.chunk_id) as s:
+                    title = _llm_chunk_title(llm, chunk.text)
+                    s.detail(updated=bool(title))
+                    if not title:
+                        continue
+                    try:
+                        self.store.update_chunk_title(chunk.chunk_id, title)
+                        self.store.commit()
+                    except Exception:
+                        log.warning("chunk title refinement: store update "
+                                   "failed, abandoning rest of memory %s",
+                                   memory_id[:8], exc_info=True)
+                        return

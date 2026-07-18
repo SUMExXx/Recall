@@ -107,8 +107,7 @@ class RecallConfig(BaseSettings):
     # idle (never inline with capture). 0 disables the automatic runs.
     consolidate_every_s: float = 120.0
 
-    # --- router / retrieval / consolidation knobs ------------------------
-    use_tier3_planner: bool = True          # off by default (plan rec. #3)
+    # --- retrieval / consolidation knobs ----------------------------------
     near_dup_cosine: float = 0.95
     dualmic_fuzzy_threshold: float = 0.85
 
@@ -116,6 +115,11 @@ class RecallConfig(BaseSettings):
     ollama_url: str = "http://localhost:11434"
     ollama_embed_model: str = "nomic-embed-text"   # 768-dim, same family as Nomic v1.5
     ollama_llm_model: str = "llama3.2:3b"
+    # Real cross-encoder reranker (ollama backend only — Ollama itself has no
+    # rerank endpoint). Empty = passthrough (fused order kept, no reordering).
+    # Loaded via sentence-transformers, NOT through Ollama; needs
+    # `pip install -e ".[rerank]"`. e.g. "BAAI/bge-reranker-v2-m3".
+    reranker_model: str = ""
 
     # --- npu backend (Snapdragon X Elite) --------------------------------
     # Embedder: Nomic-Embed-Text v1.5 re-exported at seqlen 256/512, ORT-QNN.
@@ -147,8 +151,10 @@ class RecallConfig(BaseSettings):
     # initial_prompt. Empty by default; set per deployment.
     whisper_initial_prompt: str = ""
 
-    # --- Sarvam (cloud ASR, policy-gated opt-in — plan §2) ------------------
-    # NEVER called unless PolicyEngine.is_cloud_allowed() says so. Contract:
+    # --- Sarvam STT (cloud ASR, policy-gated opt-in — plan §2) --------------
+    # NEVER called unless PolicyEngine.is_cloud_allowed() says so. Primary STT
+    # whenever cloud is opted in (falls back to local Whisper on any failure
+    # — network, timeout, not opted in). Contract:
     # docs.sarvam.ai/api-reference/speech-to-text/transcribe (POST
     # https://api.sarvam.ai/speech-to-text, multipart/form-data, header
     # api-subscription-key). Get a key at https://dashboard.sarvam.ai.
@@ -157,6 +163,18 @@ class RecallConfig(BaseSettings):
     sarvam_model: str = "saaras:v3"          # saaras:v3 (recommended) | saarika:v2.5
     sarvam_language_code: str = "unknown"    # BCP-47, or "unknown" to auto-detect
     sarvam_mode: str = "transcribe"          # transcribe|translate|verbatim|translit|codemix
-    sarvam_timeout_s: float = 3.0            # plan §2: 3s timeout -> local fallback
+    sarvam_timeout_s: float = 10.0           # primary path now — generous before local fallback
+
+    # --- Sarvam TTS (Bulbul — docs.sarvam.ai/api-reference/text-to-speech) -
+    # POST https://api.sarvam.ai/text-to-speech, same api-subscription-key
+    # header as STT. Response is JSON {"audios": ["<base64 wav>", ...]}.
+    sarvam_tts_endpoint: str = "https://api.sarvam.ai/text-to-speech"
+    sarvam_tts_model: str = "bulbul:v3"
+    sarvam_tts_speaker: str = "shubh"          # bulbul:v3 default voice
+    sarvam_tts_language_code: str = "en-IN"   # BCP-47; one of the 11 supported
+    sarvam_tts_sample_rate: int = 24000       # Hz — 8000..48000, see docs
+    sarvam_tts_codec: str = "wav"             # wav|mp3|linear16|mulaw|alaw|opus|flac|aac
+    sarvam_tts_pace: float = 1.0              # 0.5-2.0
+    sarvam_tts_timeout_s: float = 15.0
     cloud_optin: bool = False
 

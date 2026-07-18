@@ -17,7 +17,7 @@ from recall_memory.embeddings import HashEmbedder, matryoshka_coarse
 from recall_memory.ingest import Ingestor
 from recall_memory.nmo import NMO, Episode, new_id
 from recall_memory.retrieval import Retriever
-from recall_memory.router import _TIER3_SCHEMA, QUERY_TYPES, Router, _TIER3_MIN_WORDS
+from recall_memory.router import Router
 from recall_memory.store import MemoryStore
 from recall_memory.tokenizer import count_tokens, tokenize
 
@@ -217,6 +217,35 @@ def test_ollama_llm_disables_thinking_mode(monkeypatch):
     assert captured["body"]["think"] is False
 
 
+def test_ollama_reranker_is_passthrough_when_unset():
+    """Ollama has no rerank endpoint of its own — with no RECALL_RERANKER_MODEL
+    configured the fused order must pass straight through, unreordered."""
+    from recall_memory.backends.ollama import OllamaBackend
+    cfg = RecallConfig(backend="ollama", reranker_model="")
+    assert OllamaBackend(cfg).reranker.name == "passthrough"
+
+
+def test_ollama_reranker_loads_cross_encoder_when_model_configured():
+    """RECALL_RERANKER_MODEL set + sentence-transformers installed must select
+    the real local cross-encoder, not passthrough — this was silently never
+    happening before because the old code read os.environ directly, which
+    .env-loaded pydantic-settings values never populate."""
+    from recall_memory.backends.ollama import LocalTransformersReranker, OllamaBackend
+    cfg = RecallConfig(backend="ollama", reranker_model="BAAI/bge-reranker-v2-m3")
+    reranker = OllamaBackend(cfg).reranker
+    assert isinstance(reranker, LocalTransformersReranker)
+    assert reranker.name == "bge-reranker-local"
+    assert reranker.model_name == "BAAI/bge-reranker-v2-m3"
+
+
+def test_ollama_reranker_falls_back_when_sentence_transformers_missing(monkeypatch):
+    import sys
+    monkeypatch.setitem(sys.modules, "sentence_transformers", None)
+    from recall_memory.backends.ollama import OllamaBackend
+    cfg = RecallConfig(backend="ollama", reranker_model="BAAI/bge-reranker-v2-m3")
+    assert OllamaBackend(cfg).reranker.name == "passthrough"
+
+
 # ----------------------------------------------------------- embeddings
 
 def test_matryoshka_coarse_shape_and_range():
@@ -229,6 +258,76 @@ def test_matryoshka_coarse_shape_and_range():
 
 
 # -------------------------------------------------------------- ingestion
+
+def test_extractive_title_kept_when_backend_has_no_llm(store, cfg):
+    """HashBackend's NullLLM.available is False, so ingest must never try to
+    spawn the async title-refinement thread — the extractive title stands."""
+    ingestor = Ingestor(store, cfg)
+    mem_id = ingestor.ingest_document(
+        "note", "Untitled",
+        "Some rambling opening filler before the point. The actual point is "
+        "that JWT tokens expire after 30 minutes in this system.")
+    row = store.db.execute(
+        "SELECT title FROM chunks WHERE memory_id=?", (mem_id,)).fetchone()
+    assert row["title"] == _extractive_title(
+        "Some rambling opening filler before the point. The actual point is "
+        "that JWT tokens expire after 30 minutes in this system.")
+
+
+def test_ingest_refines_chunk_title_via_background_llm(monkeypatch, store, cfg):
+    """When the backend DOES have an available LLM, ingest must fire the
+    background refinement pass (run synchronously here by faking out Thread)
+    and persist the LLM's title over the extractive placeholder."""
+    from recall_memory import ingest as ingest_mod
+
+    class SyncThread:
+        def __init__(self, target, args=(), daemon=None):
+            self._target, self._args = target, args
+
+        def start(self):
+            self._target(*self._args)
+
+    monkeypatch.setattr(ingest_mod.threading, "Thread", SyncThread)
+
+    ingestor = Ingestor(store, cfg)
+    fake_llm = FakeLLM(["JWT token expiry policy"])
+    ingestor.backend.llm = fake_llm
+    mem_id = ingestor.ingest_document(
+        "note", "Untitled",
+        "Some rambling opening filler before the point. The actual point is "
+        "that JWT tokens expire after 30 minutes in this system.")
+    row = store.db.execute(
+        "SELECT title FROM chunks WHERE memory_id=?", (mem_id,)).fetchone()
+    assert row["title"] == "JWT token expiry policy"
+    assert fake_llm.calls, "the LLM must actually have been asked for a title"
+
+
+def test_ingest_keeps_extractive_title_when_llm_response_is_low_quality(
+        monkeypatch, store, cfg):
+    """A refusal/off-topic LLM answer must not overwrite the extractive title
+    — same output-validation discipline as summaries/relations (see
+    llm_validate.py): a bad write here can't be corrected later since the
+    chunk text isn't re-consulted after the fact."""
+    from recall_memory import ingest as ingest_mod
+
+    class SyncThread:
+        def __init__(self, target, args=(), daemon=None):
+            self._target, self._args = target, args
+
+        def start(self):
+            self._target(*self._args)
+
+    monkeypatch.setattr(ingest_mod.threading, "Thread", SyncThread)
+
+    ingestor = Ingestor(store, cfg)
+    ingestor.backend.llm = FakeLLM(["I'm a large language model and cannot help with that."])
+    text = ("Some rambling opening filler before the point. The actual point "
+            "is that JWT tokens expire after 30 minutes in this system.")
+    mem_id = ingestor.ingest_document("note", "Untitled", text)
+    row = store.db.execute(
+        "SELECT title FROM chunks WHERE memory_id=?", (mem_id,)).fetchone()
+    assert row["title"] == _extractive_title(text)
+
 
 def test_ingest_writes_all_indexes(seeded):
     store, _, _, ids = seeded
@@ -265,90 +364,44 @@ def test_source_specific_chunk_metadata(seeded):
 
 
 # ---------------------------------------------------------------- router
+#
+# No more tiers (plan §8's 4-tier router was removed by request — it cost
+# real, measured latency — up to 16s/query through a broken tier-3 — for
+# classification value the trace logs showed wasn't paying for itself). Every
+# query now gets one fixed plan; these tests cover what's left: entity
+# extraction (still needed so entity_index/graph aren't always empty) and
+# that retrieval runs every route uniformly regardless of query shape.
 
-def test_router_tier0_forget(store, cfg):
+def test_router_returns_flat_plan_for_every_query(store, cfg):
+    """No command detection, no query_type classification, no per-query
+    weight profile — every query gets the same fixed shape back."""
     plan = Router(store, cfg).route("forget the last 5 minutes")
-    assert plan.tier == 0
-    assert plan.command == {"action": "forget_last", "minutes": 5}
+    assert plan.query_type == "general"
+    assert plan.weight_profile == "general"
+    assert plan.filters == {}
+    assert plan.needs == {"bm25": True, "vector": True, "graph": True,
+                          "metadata_filter": False, "entity_index": True}
+    assert plan.rerank is True
 
 
-def test_router_tier1_decision_skips_vector(seeded):
+def test_router_extracts_known_entities(seeded):
+    """Entity extraction survives the tier removal — it's plain term-lookup
+    against the entity index, not classification, and both entity_index and
+    graph retrieval routes are no-ops without it."""
     store, cfg, ing, _ = seeded
-    plan = Router(store, cfg, ing.embedder).route("Who decided to use JWT?")
-    assert plan.tier == 1
-    assert plan.query_type == "decision"
-    assert plan.needs["vector"] is False
-    assert plan.needs["graph"] is True
+    plan = Router(store, cfg).route("Who decided to use JWT authentication?")
+    assert "JWT" in plan.entities
 
 
-def test_router_tier1_metadata_only(seeded):
+def test_router_same_plan_regardless_of_query_shape(seeded):
+    """A decision question, a code question, and a bare greeting all get the
+    identical fixed plan now — no more tier-dependent behavior swings."""
     store, cfg, ing, _ = seeded
-    plan = Router(store, cfg, ing.embedder).route("show me meetings from yesterday")
-    assert plan.path == "fast"
-    assert plan.needs == {"bm25": False, "vector": False, "graph": False,
-                          "metadata_filter": True, "entity_index": False}
-    assert plan.filters.get("source_type") == "meeting"
-    assert plan.filters.get("date_range") is not None
-
-
-def test_router_tier1_speaker_filter(seeded):
-    store, cfg, ing, _ = seeded
-    plan = Router(store, cfg, ing.embedder).route("What did Priya decide?")
-    assert plan.filters.get("speaker") == "Priya"
-
-
-def test_router_tier3_uses_schema_not_bare_json_flag(store, cfg):
-    """Regression for the "model echoes the enum placeholder back verbatim"
-    bug: the planner must request schema-constrained decoding (with a real
-    `enum` for query_type/path), not the old json=True + pipe-joined
-    placeholder string embedded in the prompt."""
-    fake = FakeLLM(['{"query_type": "decision", "path": "deep"}'])
-    r = Router(store, cfg, llm=fake)
-    plan = r._tier3("who decided to use redis?")
-    assert plan is not None and plan.query_type == "decision" and plan.tier == 3
-    call = fake.calls[0]
-    assert call["schema"] == _TIER3_SCHEMA
-    assert call["schema"]["properties"]["query_type"]["enum"] == list(QUERY_TYPES)
-    # the prompt must show a concrete example, never the pipe-joined enum
-    assert "meeting|code|decision|timeline|general" not in call["prompt"]
-
-
-def test_router_tier3_retries_past_a_placeholder_echo(store, cfg):
-    """Reproduces the exact failure from the bug report: attempt 1 echoes the
-    schema's enum values back as a literal pipe-joined string; that must be
-    rejected (not QUERY_TYPES) and retried, landing on attempt 2's real value."""
-    fake = FakeLLM([
-        '{"query_type": "meeting|code|decision|timeline|general", "path": "fast|deep"}',
-        '{"query_type": "general", "path": "deep"}'])
-    r = Router(store, cfg, llm=fake)
-    plan = r._tier3("what was the vector size")
-    assert plan is not None and plan.query_type == "general"
-    assert len(fake.calls) == 2
-
-
-def test_router_tier3_skipped_for_trivial_short_query(store, cfg):
-    """Regression: a bare greeting like "hi" has no plan worth extracting via
-    LLM, but with tier-3 enabled it still cost a full local round-trip
-    (measured 5-16s, and up to two failed attempts against a "thinking"
-    model that burns its whole token budget reasoning about "hi" before
-    ever emitting JSON). Below _TIER3_MIN_WORDS, tier-3 must not even be
-    attempted — straight through to tier-2 instead."""
-    fake = FakeLLM(["should never be called"])
-    r = Router(store, cfg, embedder=HashEmbedder(), llm=fake)
-    trivial = " ".join(["word"] * (_TIER3_MIN_WORDS - 1))
-    vec = HashEmbedder().embed_query(trivial)
-    plan = r.route(trivial, vec)
-    assert plan.tier == 2
-    assert fake.calls == []
-
-
-def test_router_tier2_fallthrough(seeded):
-    store, cfg, ing, _ = seeded
-    r = Router(store, cfg, ing.embedder)
-    q = "tell me about our project direction overall"
-    vec = ing.embedder.embed_query(q)
-    plan = r.route(q, vec)
-    assert plan.tier == 2
+    r = Router(store, cfg)
+    a = r.route("Who decided to use JWT?")
+    b = r.route("hi")
+    assert a.needs == b.needs
+    assert a.weight_profile == b.weight_profile == "general"
 
 
 # ------------------------------------------------------------- retrieval

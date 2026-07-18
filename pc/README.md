@@ -42,7 +42,7 @@ Memory engine (`recall_memory/`):
 | `embeddings.py` | §2, §9 | Matryoshka float[768] → int8[256] math + offline `HashEmbedder` |
 | `extractors.py` | §6 | Cheap-first entity/decision/action-item extraction; LLM relation-extraction fallback |
 | `ingest.py` | §14a | Normalize → NMO → enrich → chunk → embed → write every index |
-| `router.py` | §8 | Tier 0 commands, tier 1 rules+filters, tier 2 embedding prototypes, tier 3 LLM plan JSON (off by default) |
+| `router.py` | — | Entity extraction for the entity_index/graph routes. The 4-tier LLM-planner router (plan §8) was removed — it cost 5-8s/query for classification value the trace logs showed wasn't paying for itself; every query now gets one fixed plan (bm25+vector+graph+entity_index, RRF general profile, always reranked). |
 | `retrieval.py` | §9-11 | needs{}-gated parallel indices, weighted RRF k=60, recency/importance boost, float[768] rescore, reranker, small-to-big, **OKF skim**, cited answers |
 | `okf.py` | §7 | Organized Knowledge Files — per-repo/meeting/pdf manifests, regenerated when content changes |
 | `consolidate.py` | §12 | Dream tier — MVP jobs 1/3/4/10 **and** full jobs 2 (entity resolution), 5 (communities), 6 (summary ladder), 8 (archival), 9 (graph repair), OKF regen |

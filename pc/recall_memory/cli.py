@@ -28,8 +28,6 @@ def _open(args) -> tuple[MemoryStore, RecallConfig]:
     overrides = {"db_path": args.db}
     if args.backend:                       # else fall through to RECALL_BACKEND/env
         overrides["backend"] = args.backend
-    if getattr(args, "tier3", False):
-        overrides["use_tier3_planner"] = True
     cfg = RecallConfig(**overrides)
     return MemoryStore(cfg.db_path), cfg
 
@@ -59,7 +57,6 @@ def _main(argv=None) -> int:
 
     ask = sub.add_parser("ask")
     ask.add_argument("query")
-    ask.add_argument("--tier3", action="store_true")
     ask.add_argument("-k", type=int, default=6)
 
     search = sub.add_parser("search")
@@ -100,16 +97,12 @@ def _main(argv=None) -> int:
         out = r.ask(args.query, top_k=args.k)
         ms = (time.perf_counter() - t0) * 1000
         plan = out["plan"]
-        print(f"[tier {plan.tier} | {plan.query_type} | profile "
-              f"{plan.weight_profile} | path {plan.path} | {ms:.0f} ms]")
-        if out.get("command"):
-            print("COMMAND:", out["command"])
-        else:
-            print(out["answer"])
-            print("\nSources:")
-            for c in out["contexts"]:
-                print(f"  {c.citation()} {c.source_type:12s} "
-                      f"{c.chunk_title or c.title}")
+        print(f"[{plan.query_type} | profile {plan.weight_profile} | {ms:.0f} ms]")
+        print(out["answer"])
+        print("\nSources:")
+        for c in out["contexts"]:
+            print(f"  {c.citation()} {c.source_type:12s} "
+                  f"{c.chunk_title or c.title}")
 
     elif args.cmd == "search":
         r = Retriever(store, cfg, backend)

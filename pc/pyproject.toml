@@ -41,6 +41,15 @@ npu = [
 asr = [
     "faster-whisper>=1.0",
 ]
+# Real cross-encoder reranker for the ollama backend (laptop dev) — Ollama has
+# no rerank endpoint (bge-reranker-v2-m3 served through /api/embed only gives
+# an embedding-similarity hack, not a real cross-encoder score), so this loads
+# BAAI/bge-reranker-v2-m3 directly via sentence-transformers, GPU-accelerated
+# if CUDA is available. Set RECALL_RERANKER_MODEL to enable (see .env).
+rerank = [
+    "sentence-transformers>=3.0",
+    "torch>=2.0",
+]
 dev = [
     "pytest>=8",
 ]
