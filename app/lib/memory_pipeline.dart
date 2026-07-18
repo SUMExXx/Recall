@@ -28,6 +28,23 @@ class MemoryPipeline {
   StreamSubscription<Float32List>? _sub;
   Future<void> _tail = Future.value(); // serializes utterance processing
 
+  // ---- Wake word ("Hey Recall") ----------------------------------------
+  // Matches "hey recall" and the ways Whisper commonly mishears it
+  // ("hey, recall", "hey rekall", "hey record"). Case/punctuation-insensitive.
+  static final RegExp _wakeRe =
+      RegExp(r'hey[\s,]+re[ck]a?o?l?l|hey[\s,]+record', caseSensitive: false);
+
+  /// When true, utterances are ignored until the wake word is heard; only then
+  /// is speech saved to memory. When false, every utterance is saved (the
+  /// original always-on behaviour).
+  bool _wakeMode = true;
+  DateTime? _awakeUntil;
+  Timer? _wakeTimer;
+  final _listening = StreamController<bool>.broadcast();
+
+  /// How long Recall keeps saving after the wake word (extended by each phrase).
+  static const Duration _awakeWindow = Duration(seconds: 12);
+
   MemoryPipeline._(this._capture, this._speaker, this._transcriber, this._store,
       this._synced, this._inference);
 
@@ -57,6 +74,48 @@ class MemoryPipeline {
 
   Future<void> stop() => _capture.stop();
 
+  /// Fires `true` when the wake word opens a listening window, `false` when it
+  /// closes. The UI shows the glowing orb while this is `true`.
+  Stream<bool> get listening => _listening.stream;
+
+  /// Whether wake-word gating is on.
+  bool get wakeWordEnabled => _wakeMode;
+
+  /// Turns wake-word gating on/off. Off = save every utterance (original mode).
+  void setWakeWord(bool on) {
+    _wakeMode = on;
+    if (!on) _closeWindow(); // stop gating; any open orb hides
+  }
+
+  bool get _isAwake =>
+      _awakeUntil != null && DateTime.now().isBefore(_awakeUntil!);
+
+  void _openWindow() {
+    final wasClosed = !_isAwake;
+    _awakeUntil = DateTime.now().add(_awakeWindow);
+    _wakeTimer?.cancel();
+    _wakeTimer = Timer(_awakeWindow, _closeWindow);
+    if (wasClosed) _listening.add(true);
+  }
+
+  void _closeWindow() {
+    _wakeTimer?.cancel();
+    _wakeTimer = null;
+    if (_awakeUntil != null) {
+      _awakeUntil = null;
+      _listening.add(false);
+    }
+  }
+
+  /// If [text] contains the wake word, returns whatever was said after it
+  /// (possibly empty); otherwise null.
+  static String? _afterWakeWord(String text) {
+    final m = _wakeRe.firstMatch(text);
+    if (m == null) return null;
+    // Drop leading punctuation Whisper leaves after the wake phrase.
+    return text.substring(m.end).replaceFirst(RegExp(r'^[\s,.!?:;-]+'), '').trim();
+  }
+
   void _enqueue(Float32List samples) {
     _tail = _tail.then((_) => _process(samples));
   }
@@ -64,6 +123,22 @@ class MemoryPipeline {
   Future<void> _process(Float32List samples) async {
     final text = await _transcriber.transcribe(samples);
     if (text.isEmpty) return;
+
+    if (_wakeMode && !_isAwake) {
+      // Asleep: only the wake word matters. Anything else is ignored.
+      final after = _afterWakeWord(text);
+      if (after == null) return;
+      _openWindow();
+      if (after.isNotEmpty) await _save(after, samples);
+      return;
+    }
+
+    // Awake (or wake mode off): save the utterance and keep the window open.
+    if (_wakeMode) _openWindow();
+    await _save(text, samples);
+  }
+
+  Future<void> _save(String text, Float32List samples) async {
     final who = await _speaker.identify(samples) ?? 'unknown';
     final id = await _store.add(Memory(
       timestamp: DateTime.now(),
@@ -119,6 +194,8 @@ class MemoryPipeline {
   Future<void> removeSpeaker(String name) => _speaker.remove(name);
 
   Future<void> dispose() async {
+    _wakeTimer?.cancel();
+    await _listening.close();
     await _sub?.cancel();
     await _capture.dispose();
     await _speaker.dispose();

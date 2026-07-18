@@ -6,6 +6,7 @@ import 'util/audio_util.dart';
 import 'chat_store.dart';
 import 'memory_pipeline.dart';
 import 'pipeline/vector_store.dart';
+import 'widgets/listening_orb.dart';
 
 class HomePage extends StatefulWidget {
   const HomePage({super.key});
@@ -38,6 +39,11 @@ class _HomePageState extends State<HomePage>
   StreamSubscription<String>? _syncSub;
   String _syncStatus = '';
 
+  StreamSubscription<bool>? _wakeSub;
+  bool _listening = false; // orb visible: wake window open
+  bool _wakeEnabled = true;
+  bool _showWakeIntro = false; // first-run wake-word onboarding
+
   ChatStore? _chat;
   final List<ChatMessage> _messages = [];
   final _chatScroll = ScrollController();
@@ -54,6 +60,7 @@ class _HomePageState extends State<HomePage>
       _statusSub = pipe.status.listen((s) => setState(() => _status = s));
       _memorySub = pipe.onMemory.listen((_) => _refresh());
       _syncSub = pipe.syncStatus.listen((s) => setState(() => _syncStatus = s));
+      _wakeSub = pipe.listening.listen((v) => setState(() => _listening = v));
       _pipe = pipe;
       _chat = await ChatStore.create();
       final history = await _chat!.history();
@@ -61,7 +68,9 @@ class _HomePageState extends State<HomePage>
       final speakers = await pipe.enrolledSpeakers();
       setState(() {
         _status = 'Idle';
+        _wakeEnabled = pipe.wakeWordEnabled;
         _needsSetup = speakers.isEmpty; // first run → recognize + add the user
+        _showWakeIntro = speakers.isEmpty; // first run → explain the wake word
       });
       await _refresh();
     } catch (e) {
@@ -113,6 +122,35 @@ class _HomePageState extends State<HomePage>
       }
       setState(() => _capturing = true);
     }
+  }
+
+  /// Ensures the mic is capturing so the wake word can be heard. Returns false
+  /// only if permission was denied.
+  Future<bool> _ensureCapturing() async {
+    if (_capturing) return true;
+    final ok = await _pipe!.start();
+    if (ok) setState(() => _capturing = true);
+    return ok;
+  }
+
+  Future<void> _toggleWake() async {
+    final on = !_wakeEnabled;
+    _pipe!.setWakeWord(on);
+    setState(() => _wakeEnabled = on);
+    if (on && !await _ensureCapturing()) {
+      _toast('Microphone permission denied');
+      return;
+    }
+    _toast(on ? 'Say “Hey Recall” to save a memory' : 'Wake word off');
+  }
+
+  Future<void> _finishWakeIntro(bool enable) async {
+    _pipe!.setWakeWord(enable);
+    setState(() {
+      _wakeEnabled = enable;
+      _showWakeIntro = false;
+    });
+    if (enable) await _ensureCapturing();
   }
 
   Future<void> _search() async {
@@ -337,6 +375,7 @@ class _HomePageState extends State<HomePage>
     _statusSub?.cancel();
     _memorySub?.cancel();
     _syncSub?.cancel();
+    _wakeSub?.cancel();
     _queryController.dispose();
     _nameController.dispose();
     _askController.dispose();
@@ -349,7 +388,7 @@ class _HomePageState extends State<HomePage>
 
   @override
   Widget build(BuildContext context) {
-    if (_pipe != null && !_needsSetup) return _buildReady();
+    if (_pipe != null && !_needsSetup && !_showWakeIntro) return _buildReady();
 
     return Scaffold(
       appBar: AppBar(title: const Text('Recall')),
@@ -371,7 +410,9 @@ class _HomePageState extends State<HomePage>
                     ],
                   ),
                 )
-              : _buildSetup(),
+              : _needsSetup
+                  ? _buildSetup()
+                  : _buildWakeIntro(),
     );
   }
 
@@ -383,6 +424,11 @@ class _HomePageState extends State<HomePage>
       appBar: AppBar(
           title: const Text('Recall'),
           actions: [
+            IconButton(
+              tooltip: _wakeEnabled ? 'Hey Recall: on' : 'Hey Recall: off',
+              onPressed: _toggleWake,
+              icon: Icon(_wakeEnabled ? Icons.hearing : Icons.hearing_disabled),
+            ),
             IconButton(
               tooltip: 'PC sync',
               onPressed: _syncSettings,
@@ -417,9 +463,14 @@ class _HomePageState extends State<HomePage>
           ],
         ),
       ),
-      body: TabBarView(
-        controller: _tabs,
-        children: [_buildBody(), _buildAsk()],
+      body: Stack(
+        children: [
+          TabBarView(
+            controller: _tabs,
+            children: [_buildBody(), _buildAsk()],
+          ),
+          Positioned.fill(child: ListeningOrb(visible: _listening)),
+        ],
       ),
       floatingActionButton: onMemoriesTab
           ? FloatingActionButton.extended(
@@ -574,6 +625,65 @@ class _HomePageState extends State<HomePage>
             TextButton(
               onPressed: _recording ? null : () => setState(() => _needsSetup = false),
               child: const Text('Skip for now'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// First-run onboarding for the "Hey Recall" wake word, with a preview orb.
+  Widget _buildWakeIntro() {
+    final color = Theme.of(context).colorScheme.primary;
+    return Center(
+      child: SingleChildScrollView(
+        padding: const EdgeInsets.all(24),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Center(
+              child: Container(
+                width: 96,
+                height: 96,
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  gradient: RadialGradient(
+                    colors: [Colors.white, color, color.withOpacity(0.55)],
+                    stops: const [0.0, 0.55, 1.0],
+                  ),
+                  boxShadow: [
+                    BoxShadow(
+                      color: color.withOpacity(0.6),
+                      blurRadius: 40,
+                      spreadRadius: 12,
+                    ),
+                  ],
+                ),
+              ),
+            ),
+            const SizedBox(height: 32),
+            Text(
+              'Say “Hey Recall”',
+              style: Theme.of(context).textTheme.headlineSmall,
+              textAlign: TextAlign.center,
+            ),
+            const SizedBox(height: 12),
+            const Text(
+              'Recall listens in the background. Whenever you say '
+              '“Hey Recall”, a glowing orb rises from the bottom and Recall '
+              'saves what you say next to your memories.',
+              textAlign: TextAlign.center,
+            ),
+            const SizedBox(height: 28),
+            FilledButton.icon(
+              onPressed: () => _finishWakeIntro(true),
+              icon: const Icon(Icons.hearing),
+              label: const Text('Enable “Hey Recall”'),
+            ),
+            TextButton(
+              onPressed: () => _finishWakeIntro(false),
+              child: const Text('Not now'),
             ),
           ],
         ),
