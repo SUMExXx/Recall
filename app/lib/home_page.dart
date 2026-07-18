@@ -73,6 +73,12 @@ class _HomePageState extends State<HomePage>
         _showWakeIntro = speakers.isEmpty; // first run → explain the wake word
       });
       await _refresh();
+      // Always-on wake word: start listening in the background as soon as the
+      // app opens so "Hey Recall" works without tapping Start (like Google
+      // Assistant). First-run users start capturing from the wake-word intro.
+      if (_wakeEnabled && !_needsSetup && !_showWakeIntro) {
+        await _ensureCapturing();
+      }
     } catch (e) {
       setState(() => _initError = '$e');
     }
