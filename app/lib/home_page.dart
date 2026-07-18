@@ -31,7 +31,8 @@ class _HomePageState extends State<HomePage>
   StreamSubscription<Memory>? _memorySub;
 
   String _status = 'Loading models…';
-  bool _capturing = false;
+  bool _capturing = false; // mic subscription is live
+  bool _manualCapture = false; // FAB: actively saving every utterance
   bool _searching = false;
   bool _needsSetup = false; // first run: no speaker enrolled yet
   bool _recording = false;
@@ -73,11 +74,12 @@ class _HomePageState extends State<HomePage>
         _showWakeIntro = speakers.isEmpty; // first run → explain the wake word
       });
       await _refresh();
-      // Always-on wake word: start listening in the background as soon as the
-      // app opens so "Hey Recall" works without tapping Start (like Google
-      // Assistant). First-run users start capturing from the wake-word intro.
-      if (_wakeEnabled && !_needsSetup && !_showWakeIntro) {
-        await _ensureCapturing();
+      // Always-on wake word: start background listening as soon as the app
+      // opens so "Hey Recall" works without tapping Start (like Google
+      // Assistant). First-run users start from the wake-word intro instead.
+      if (!_needsSetup && !_showWakeIntro) {
+        _applyWakeMode();
+        await _syncMic();
       }
     } catch (e) {
       setState(() => _initError = '$e');
@@ -115,48 +117,65 @@ class _HomePageState extends State<HomePage>
     });
   }
 
+  /// The FAB toggles a manual "save everything" session. Ending it leaves the
+  /// mic running for the wake word (if enabled) — only turning the wake word
+  /// off actually stops background listening.
   Future<void> _toggleCapture() async {
-    final pipe = _pipe!;
-    if (_capturing) {
-      await pipe.stop();
-      setState(() => _capturing = false);
-    } else {
-      final ok = await pipe.start();
-      if (!ok) {
-        _toast('Microphone permission denied');
-        return;
-      }
-      setState(() => _capturing = true);
+    setState(() => _manualCapture = !_manualCapture);
+    _applyWakeMode();
+    if (!await _syncMic()) {
+      // Permission denied — roll back the toggle.
+      setState(() => _manualCapture = !_manualCapture);
+      _applyWakeMode();
     }
   }
 
-  /// Ensures the mic is capturing so the wake word can be heard. Returns false
-  /// only if permission was denied.
-  Future<bool> _ensureCapturing() async {
-    if (_capturing) return true;
-    final ok = await _pipe!.start();
-    if (ok) setState(() => _capturing = true);
-    return ok;
+  /// Tells the pipeline whether to gate on the wake word. We save every
+  /// utterance during a manual capture session; otherwise we gate whenever the
+  /// wake word is enabled.
+  void _applyWakeMode() {
+    _pipe!.setWakeWord(_wakeEnabled && !_manualCapture);
+  }
+
+  /// Brings the mic subscription in line with what's needed: it must run while
+  /// the wake word is enabled or a manual capture session is active, and can be
+  /// released otherwise. Returns false only if mic permission was denied.
+  Future<bool> _syncMic() async {
+    final shouldRun = _wakeEnabled || _manualCapture;
+    if (shouldRun && !_capturing) {
+      final ok = await _pipe!.start();
+      if (!ok) {
+        _toast('Microphone permission denied');
+        return false;
+      }
+      setState(() => _capturing = true);
+    } else if (!shouldRun && _capturing) {
+      await _pipe!.stop();
+      setState(() => _capturing = false);
+    }
+    return true;
   }
 
   Future<void> _toggleWake() async {
-    final on = !_wakeEnabled;
-    _pipe!.setWakeWord(on);
-    setState(() => _wakeEnabled = on);
-    if (on && !await _ensureCapturing()) {
-      _toast('Microphone permission denied');
+    setState(() => _wakeEnabled = !_wakeEnabled);
+    _applyWakeMode();
+    if (!await _syncMic()) {
+      setState(() => _wakeEnabled = !_wakeEnabled);
+      _applyWakeMode();
       return;
     }
-    _toast(on ? 'Say “Hey Recall” to save a memory' : 'Wake word off');
+    _toast(_wakeEnabled
+        ? 'Say “Hey Recall” to save a memory'
+        : 'Wake word off');
   }
 
   Future<void> _finishWakeIntro(bool enable) async {
-    _pipe!.setWakeWord(enable);
     setState(() {
       _wakeEnabled = enable;
       _showWakeIntro = false;
     });
-    if (enable) await _ensureCapturing();
+    _applyWakeMode();
+    await _syncMic();
   }
 
   Future<void> _search() async {
@@ -335,14 +354,22 @@ class _HomePageState extends State<HomePage>
     final name = await _promptName();
     if (name == null || name.isEmpty) return;
 
-    if (_capturing) await _toggleCapture(); // free the mic
+    // recordSamples needs exclusive mic access — release ours, then restore
+    // background listening afterwards.
+    final wasCapturing = _capturing;
+    if (wasCapturing) {
+      await _pipe!.stop();
+      setState(() => _capturing = false);
+    }
     _toast('Recording 8s — keep talking…');
     final samples = await recordSamples(const Duration(seconds: 8));
     if (samples == null) {
       _toast('Microphone permission denied');
+      if (wasCapturing) await _syncMic();
       return;
     }
     await _pipe!.enroll(name, samples);
+    if (wasCapturing) await _syncMic();
     _toast('Enrolled "$name"');
   }
 
@@ -481,8 +508,8 @@ class _HomePageState extends State<HomePage>
       floatingActionButton: onMemoriesTab
           ? FloatingActionButton.extended(
               onPressed: _toggleCapture,
-              icon: Icon(_capturing ? Icons.stop : Icons.mic),
-              label: Text(_capturing ? 'Stop' : 'Start'),
+              icon: Icon(_manualCapture ? Icons.stop : Icons.mic),
+              label: Text(_manualCapture ? 'Stop' : 'Record'),
             )
           : null,
     );
