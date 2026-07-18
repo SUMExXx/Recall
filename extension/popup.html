@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Recall</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <header>
+    <span class="logo">Recall</span>
+    <span id="status-dot" class="dot dot-unknown" title="Hub connection status"></span>
+  </header>
+  <p id="status-text" class="muted">Checking hub connection…</p>
+
+  <!-- Feature buttons -->
+  <div class="feature-grid">
+    <button class="feature-btn" id="btn-screenshot">
+      <span class="feat-icon">📸</span>
+      <span class="feat-label">Screenshot<br>→ Memory</span>
+    </button>
+    <button class="feature-btn" id="btn-save-pdf">
+      <span class="feat-icon">📄</span>
+      <span class="feat-label">Save this<br>PDF</span>
+    </button>
+    <button class="feature-btn" id="btn-save-github">
+      <span class="feat-icon">🗂️</span>
+      <span class="feat-label">Save GitHub<br>repo</span>
+    </button>
+  </div>
+  <p id="feature-status" class="muted"></p>
+
+  <div class="divider"></div>
+
+  <!-- Manual text save -->
+  <textarea id="manual-text" placeholder="Paste or type anything to save as a memory…"></textarea>
+  <button id="save-btn" class="primary">Save memory</button>
+  <p id="save-status" class="muted"></p>
+
+  <footer>
+    <span id="hub-url" class="muted"></span>
+    <a href="#" id="open-options">Settings</a>
+  </footer>
+
+  <script src="popup.js"></script>
+</body>
+</html>
