@@ -14,9 +14,10 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from .backends import get_backend
 from .config import (ANSWER_TOPK, COARSE_TOPK, DIM_FULL, RECENCY_HALF_LIFE_DAYS,
                      RERANK_TOPK, RRF_K, WEIGHT_PROFILES, RecallConfig)
-from .embeddings import get_embedder, matryoshka_coarse
+from .embeddings import matryoshka_coarse
 from .router import RoutePlan, Router
 from .store import MemoryStore
 
@@ -49,22 +50,17 @@ def _rrf_fuse(route_lists: dict[str, list[tuple[int, float]]],
     return fused
 
 
-class PassthroughReranker:
-    """Slot for Qwen3-Reranker-0.6B on the event PC (bge-reranker CPU fallback)."""
-
-    def rerank(self, query: str, candidates: list[tuple[int, float, str]]
-               ) -> list[tuple[int, float]]:
-        return [(cid, score) for cid, score, _text in candidates]
-
-
 class Retriever:
     def __init__(self, store: MemoryStore, cfg: RecallConfig | None = None,
-                 embedder=None, reranker=None):
+                 backend=None, reranker=None):
         self.store = store
         self.cfg = cfg or RecallConfig()
-        self.embedder = embedder or get_embedder(self.cfg)
-        self.reranker = reranker or PassthroughReranker()
-        self.router = Router(store, self.cfg, self.embedder)
+        self.backend = backend or get_backend(self.cfg)
+        self.embedder = self.backend.embedder
+        self.reranker = reranker or self.backend.reranker
+        self.llm = self.backend.llm
+        self.router = Router(store, self.cfg, embedder=self.embedder,
+                             llm=self.llm)
 
     # ------------------------------------------------------------ pipeline
 
@@ -177,11 +173,36 @@ class Retriever:
         contexts = self.retrieve(query, plan, top_k=top_k)
         if not contexts:
             return {"answer": "NOTFOUND — no matching memories.",
-                    "plan": plan, "contexts": []}
-        answer = self._synthesize(query, contexts)
-        return {"answer": answer, "plan": plan, "contexts": contexts}
+                    "plan": plan, "contexts": [], "okf": None}
+        okf = self._okf_for_contexts(contexts)
+        answer = self._synthesize(query, contexts, okf)
+        return {"answer": answer, "plan": plan, "contexts": contexts, "okf": okf}
 
-    def _synthesize(self, query: str, contexts: list[RetrievedContext]) -> str:
+    def _okf_for_contexts(self, contexts: list[RetrievedContext]) -> dict | None:
+        """Skim-the-README (plan §7): if one source root dominates the hits and
+        it has an OKF manifest, hand that to the LLM first."""
+        from collections import Counter
+        keymap = {"meeting": "meeting_id", "github_repo": "repo",
+                  "pdf": "document_title"}
+        roots: Counter = Counter()
+        for c in contexts:
+            key = keymap.get(c.source_type)
+            val = c.meta.get(key) if key else None
+            if val:
+                roots[(c.source_type, val)] += 1
+        if not roots:
+            return None
+        total = len(contexts)
+        (stype, skey), n = roots.most_common(1)[0]
+        # attach when the hits are essentially about one source: either every
+        # context shares the root, or it holds a clear majority (>=2).
+        if not (n == total or n >= max(2, (total + 1) // 2)):
+            return None
+        row = self.store.get_okf(stype, skey)
+        return json.loads(row["manifest"]) if row else None
+
+    def _synthesize(self, query: str, contexts: list[RetrievedContext],
+                    okf: dict | None = None) -> str:
         blocks = []
         for c in contexts:
             src = c.title or c.source_type
@@ -190,22 +211,19 @@ class Retriever:
                 body = "\n".join(f'{e["speaker"]}: {e["text"]}' for e in c.episodes)
             blocks.append(f"--- {c.citation()} ({c.source_type}: {src})\n{body}")
         context_str = "\n".join(blocks)
+        okf_block = ""
+        if okf:
+            okf_block = ("SOURCE OVERVIEW (skim this table of contents first):\n"
+                         + json.dumps(okf, ensure_ascii=False)[:1200] + "\n\n")
         prompt = (
             "You are Recall, an on-device memory assistant. Answer the question "
             "using ONLY the memory excerpts below. Cite the [id:chunk] markers "
             "of the excerpts you used. If the excerpts do not contain the "
             "answer, reply exactly NOTFOUND.\n\n"
-            f"MEMORY EXCERPTS:\n{context_str}\n\nQUESTION: {query}\nANSWER:")
+            f"{okf_block}MEMORY EXCERPTS:\n{context_str}\n\nQUESTION: {query}\nANSWER:")
         try:
-            import requests
-            r = requests.post(
-                f"{self.cfg.ollama_url.rstrip('/')}/api/chat",
-                json={"model": self.cfg.llm_model, "stream": False,
-                      "messages": [{"role": "user", "content": prompt}]},
-                timeout=180)
-            r.raise_for_status()
-            return r.json()["message"]["content"].strip()
+            return self.llm.generate(prompt)
         except Exception:
-            # Offline fallback: hand back the raw evidence.
+            # Offline / no-LLM fallback: hand back the raw evidence.
             return "LLM unavailable — top matches:\n" + "\n".join(
                 f"{c.citation()} {c.text[:160]}" for c in contexts)

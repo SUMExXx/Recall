@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Recall - Capture (fallback)</title>
+<style>
+  body{background:#12100c; color:#ece7db; font-family:-apple-system,sans-serif;
+       margin:0; padding:24px; text-align:center}
+  button{font-size:18px; padding:16px 32px; border-radius:999px; border:none;
+         background:#f0a030; color:#12100c; font-weight:700}
+  button.stop{background:#e8837c}
+  #dot{display:inline-block; width:10px; height:10px; border-radius:50%;
+       background:#a39b8a; margin-right:8px}
+  #dot.live{background:#57c87b}
+  #status{margin-top:16px; font-size:13px; color:#a39b8a}
+  #debug{margin-top:16px; font-size:12px; color:#a39b8a; font-family:monospace;
+         line-height:1.8}
+  #error{margin-top:12px; font-size:12px; color:#e8837c; white-space:pre-wrap}
+  a{color:#f0a030}
+</style>
+</head>
+<body>
+<h2>Recall - capture</h2>
+<p>Web mic capture streaming PCM16 to the hub's <code>/ws</code>. The hub
+buffers ~6 s windows and transcribes them via the ASR worker (needs a
+whisper.cpp-contract server at <code>RECALL_WHISPER_URL</code>). Requires a
+secure context - use <code>http://localhost:8000/capture</code>.</p>
+<button id="toggle">Start capture</button>
+<p id="status"><span id="dot"></span>disconnected</p>
+<div id="debug">chunks: 0 · bytes sent: 0 · last chunk: 0 B<br>
+audioContext state: - · ws state: -</div>
+<div id="error"></div>
+
+<script>
+let ws, audioCtx, source, processor, stream;
+let chunks = 0, bytesSent = 0, lastChunk = 0, live = false;
+const btn = document.getElementById('toggle');
+const dot = document.getElementById('dot');
+const status = document.getElementById('status');
+const debugEl = document.getElementById('debug');
+const errorEl = document.getElementById('error');
+
+function renderDebug() {
+  const wsState = ws ? ['connecting','open','closing','closed'][ws.readyState] : '-';
+  const ctxState = audioCtx ? audioCtx.state : '-';
+  debugEl.innerHTML = `chunks: ${chunks} &middot; bytes sent: ${bytesSent} ` +
+    `&middot; last chunk: ${lastChunk} B<br>audioContext state: ${ctxState} ` +
+    `&middot; ws state: ${wsState}`;
+}
+setInterval(renderDebug, 500);
+
+function floatTo16BitPCM(input) {
+  const output = new Int16Array(input.length);
+  for (let i = 0; i < input.length; i++) {
+    const s = Math.max(-1, Math.min(1, input[i]));
+    output[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+  }
+  return output;
+}
+
+async function start() {
+  errorEl.textContent = '';
+  chunks = 0; bytesSent = 0; lastChunk = 0;
+  try {
+    ws = new WebSocket(`ws://${location.host}/ws`);
+    ws.binaryType = 'arraybuffer';
+    ws.onopen = () => {
+      // hub protocol: hello, then meeting_start, then binary PCM16 frames
+      ws.send(JSON.stringify({type: 'hello', device_id: 'web-capture',
+                              role: 'phone'}));
+      ws.send(JSON.stringify({type: 'meeting_start',
+                              capture_device: 'mobile',
+                              title: 'Web fallback capture'}));
+      dot.classList.add('live');
+      status.textContent = 'streaming';
+    };
+    ws.onclose = () => {
+      dot.classList.remove('live');
+      status.textContent = 'disconnected';
+      renderDebug();
+    };
+    ws.onerror = () => { errorEl.textContent += '\nWebSocket error'; };
+    ws.onmessage = (e) => {
+      try {
+        const m = JSON.parse(e.data);
+        if (m.type === 'meeting_started')
+          status.textContent = `streaming · ${m.meeting_id}`;
+        if (m.type === 'event' && m.topic === 'transcript' && m.data.text)
+          errorEl.textContent = '';   // ASR alive
+        if (m.type === 'event' && m.topic === 'transcript' && m.data.error)
+          errorEl.textContent = m.data.error;
+      } catch (err) {}
+    };
+
+    stream = await navigator.mediaDevices.getUserMedia(
+      {audio: {channelCount: 1, sampleRate: 16000}});
+
+    audioCtx = new AudioContext({sampleRate: 16000});
+    // Awaiting getUserMedia's permission prompt can consume the button tap's
+    // user-activation, leaving a freshly created AudioContext 'suspended' -
+    // onaudioprocess then silently never fires. Force it awake explicitly.
+    if (audioCtx.state === 'suspended') await audioCtx.resume();
+
+    source = audioCtx.createMediaStreamSource(stream);
+    processor = audioCtx.createScriptProcessor(2048, 1, 1); // ~128 ms @ 16 kHz
+    source.connect(processor);
+    processor.connect(audioCtx.destination);
+    processor.onaudioprocess = (e) => {
+      chunks++;
+      const pcm16 = floatTo16BitPCM(e.inputBuffer.getChannelData(0));
+      lastChunk = pcm16.buffer.byteLength;
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(pcm16.buffer);
+        bytesSent += lastChunk;
+      }
+    };
+
+    btn.textContent = 'Stop capture';
+    btn.classList.add('stop');
+  } catch (e) {
+    errorEl.textContent = `start() failed: ${e.name}: ${e.message}`;
+    live = false;
+    btn.textContent = 'Start capture';
+    btn.classList.remove('stop');
+  }
+  renderDebug();
+}
+
+function stop() {
+  if (processor) processor.disconnect();
+  if (source) source.disconnect();
+  if (audioCtx) audioCtx.close();
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({type: 'meeting_end'}));
+    setTimeout(() => ws.close(), 500);   // let the ack arrive
+  } else if (ws) ws.close();
+  btn.textContent = 'Start capture';
+  btn.classList.remove('stop');
+  renderDebug();
+}
+
+btn.addEventListener('click', async () => {
+  live = !live;
+  if (live) await start(); else stop();
+});
+</script>
+</body>
+</html>

@@ -10,6 +10,7 @@ Runs as a background/idle job — never inline with ingestion.
 from __future__ import annotations
 
 import difflib
+import hashlib
 import json
 import math
 import time
@@ -17,8 +18,14 @@ import time
 import numpy as np
 
 from .config import DIM_FULL, RecallConfig
+from .extractors import llm_extract_relation
 from .nmo import now_epoch
+from .okf import OKFGenerator
 from .store import MemoryStore
+
+
+def _h(*parts: str) -> str:
+    return hashlib.sha256("".join(parts).encode("utf-8")).hexdigest()
 
 
 class Consolidator:
@@ -27,6 +34,9 @@ class Consolidator:
         self.store = store
         self.cfg = cfg or RecallConfig()
         self.ingestor = ingestor  # needed by job 10 to re-ingest merged meetings
+        # the LLM (if any) rides along on the ingestor's backend — used by the
+        # summary ladder and the §6 relation-extraction fallback; None on hash.
+        self.llm = getattr(getattr(ingestor, "backend", None), "llm", None)
 
     # ------------------------------------------------- job 1: duplicates
 
@@ -237,11 +247,231 @@ class Consolidator:
                 chosen[dup_of] = ep
         return sorted(chosen, key=lambda e: e["t_start"])
 
+    # ------------------------------------------- job 2: entity resolution
+
+    @staticmethod
+    def _same_entity(a: str, b: str) -> bool:
+        a, b = a.lower(), b.lower()
+        if a == b:
+            return False
+        if a in b or b in a:                       # postgres ⊂ postgresql, jwt ⊂ jwts
+            return abs(len(a) - len(b)) <= 4
+        return difflib.SequenceMatcher(None, a, b).ratio() >= 0.9
+
+    def job_entity_resolution(self) -> int:
+        """Cluster entity ids that denote the same thing and rewrite mentions to
+        one canonical id (the most-frequent variant). This is what keeps the
+        cross-source entity/reverse index from fragmenting ("GPT"/"ChatGPT")."""
+        rows = self.store.db.execute(
+            """SELECT entity_id, entity_text, count(*) c FROM entity_mentions
+               GROUP BY entity_id ORDER BY c DESC, entity_id""").fetchall()
+        ids = [(r["entity_id"], r["entity_text"]) for r in rows]
+        parent = {eid: eid for eid, _ in ids}
+
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        merges = 0
+        for i in range(len(ids)):
+            for j in range(i + 1, len(ids)):
+                if find(ids[i][0]) == find(ids[j][0]):
+                    continue
+                if self._same_entity(ids[i][1], ids[j][1]):
+                    parent[find(ids[j][0])] = find(ids[i][0])  # into higher-count
+                    merges += 1
+        if not merges:
+            return 0
+        rep: dict[str, tuple[str, str]] = {}
+        for eid, txt in ids:                       # first per root = highest count
+            rep.setdefault(find(eid), (eid, txt))
+        for eid, _ in ids:
+            canon_id, canon_txt = rep[find(eid)]
+            if eid != canon_id:
+                self.store.db.execute(
+                    "UPDATE entity_mentions SET entity_id=?, entity_text=? "
+                    "WHERE entity_id=?", (canon_id, canon_txt, eid))
+        self.store.commit()
+        return merges
+
+    # -------------------------------------------- job 5: community detection
+
+    def job_communities(self) -> int:
+        """Group memories that co-mention entities into clusters (union-find),
+        labelled by their most-shared entity. Lets retrieval pull a whole
+        cluster ("everything touching Redis + caching")."""
+        rows = self.store.db.execute(
+            """SELECT DISTINCT em.entity_id, em.memory_id FROM entity_mentions em
+               JOIN memories m ON m.memory_id = em.memory_id
+               WHERE m.archived = 0""").fetchall()
+        ent_to_mems: dict[str, set] = {}
+        for r in rows:
+            ent_to_mems.setdefault(r["entity_id"], set()).add(r["memory_id"])
+        parent: dict[str, str] = {}
+
+        def find(x):
+            parent.setdefault(x, x)
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        for mems in ent_to_mems.values():
+            members = list(mems)
+            for m in members:
+                find(m)
+            for m in members[1:]:
+                parent[find(members[0])] = find(m)
+        comps: dict[str, set] = {}
+        for m in list(parent):
+            comps.setdefault(find(m), set()).add(m)
+        communities: list[tuple[str, list[str]]] = []
+        for members in comps.values():
+            if len(members) < 2:
+                continue
+            label = max(ent_to_mems,
+                        key=lambda e: len(ent_to_mems[e] & members))
+            communities.append((label, sorted(members)))
+        self.store.replace_communities(communities)
+        return len(communities)
+
+    # --------------------------------------------- job 6: summary ladder
+
+    def _summarize(self, extractive: str, facts: str) -> str:
+        if self.llm is not None and getattr(self.llm, "available", False):
+            try:
+                return self.llm.generate(
+                    f"Summarize in 2-3 sentences.\n{facts}", timeout=60)
+            except Exception:
+                pass
+        return extractive
+
+    def job_summaries(self) -> int:
+        """Chunk -> meeting -> daily ladder (plan §12 job 6). Regenerates only
+        changed levels; backfills empty NMO summaries so OKF/digest have text."""
+        n = 0
+        for mem in self.store.db.execute(
+                "SELECT * FROM memories WHERE source_type='meeting' AND archived=0"):
+            meta = json.loads(mem["source_meta"] or "{}")
+            parts = []
+            if meta.get("decisions"):
+                parts.append("Decisions: " + "; ".join(meta["decisions"]))
+            if meta.get("action_items"):
+                parts.append("Actions: " + "; ".join(meta["action_items"]))
+            extractive = " ".join(parts) or mem["title"]
+            text = self._summarize(extractive, extractive)
+            key = meta.get("meeting_id") or mem["memory_id"]
+            self.store.upsert_summary("meeting", key, text, _h(key, extractive))
+            if not (mem["summary"] or "").strip():
+                self.store.db.execute(
+                    "UPDATE memories SET summary=? WHERE memory_id=?",
+                    (text[:400], mem["memory_id"]))
+            n += 1
+        days: dict[str, list] = {}
+        for mem in self.store.db.execute(
+                "SELECT title, created_at FROM memories WHERE archived=0"):
+            day = time.strftime("%Y-%m-%d", time.localtime(mem["created_at"]))
+            days.setdefault(day, []).append(mem["title"])
+        for day, titles in days.items():
+            text = " · ".join(titles[:20])
+            self.store.upsert_summary("daily", day, text, _h(day, text))
+            n += 1
+        self.store.commit()
+        return n
+
+    # ---------------------------------------- job 8: dead-memory archival
+
+    def job_archival(self, max_age_days: float = 90.0,
+                     importance_floor: float = 0.15) -> int:
+        """Low-importance + old + never-referenced -> archive out of the hot
+        indexes. Never hard-deletes (plan §12 job 8)."""
+        now = time.time()
+        n = 0
+        for m in self.store.db.execute(
+                "SELECT memory_id, created_at, importance, tags FROM memories "
+                "WHERE archived=0"):
+            age_days = (now - m["created_at"]) / 86400.0
+            refs = self.store.db.execute(
+                "SELECT count(*) c FROM entity_mentions WHERE memory_id=?",
+                (m["memory_id"],)).fetchone()["c"]
+            bookmarked = "bookmarked" in (m["tags"] or "")
+            if (not bookmarked and age_days > max_age_days
+                    and (m["importance"] or 0.0) < importance_floor and refs == 0):
+                self.store.db.execute(
+                    "UPDATE memories SET archived=1, updated_at=? WHERE memory_id=?",
+                    (now_epoch(), m["memory_id"]))
+                n += 1
+        self.store.commit()
+        return n
+
+    # ------------------------------------------------ job 9: graph repair
+
+    def job_graph_repair(self) -> int:
+        """Sweep orphaned chunks / entity mentions / relations left by merges
+        or partial deletes (plan §12 job 9)."""
+        repaired = 0
+        orphans = [r["chunk_id"] for r in self.store.db.execute(
+            "SELECT chunk_id FROM chunks WHERE memory_id NOT IN "
+            "(SELECT memory_id FROM memories)")]
+        self.store._delete_chunks(orphans)
+        repaired += len(orphans)
+        repaired += self.store.db.execute(
+            "DELETE FROM entity_mentions WHERE chunk_id NOT IN "
+            "(SELECT chunk_id FROM chunks)").rowcount
+        repaired += self.store.db.execute(
+            "DELETE FROM relations WHERE memory_id NOT IN "
+            "(SELECT memory_id FROM memories)").rowcount
+        self.store.commit()
+        return repaired
+
+    # ---------------------------- §6 relation extraction (LLM fallback)
+
+    def job_llm_relations(self, limit: int = 20) -> int:
+        """Escalate meeting chunks with no extracted relations to the LLM for a
+        (subject, predicate, object) triple. No-op without an available LLM."""
+        if self.llm is None or not getattr(self.llm, "available", False):
+            return 0
+        added = 0
+        rows = self.store.db.execute(
+            """SELECT chunk_id, memory_id, text FROM chunks
+               WHERE source_type='meeting'
+                 AND memory_id NOT IN (SELECT DISTINCT memory_id FROM relations)
+               LIMIT ?""", (limit,)).fetchall()
+        for r in rows:
+            rel = llm_extract_relation(r["text"], self.llm)
+            if rel:
+                self.store.add_relation(r["memory_id"], rel["subject"],
+                                        rel["predicate"], rel["object"])
+                added += 1
+        self.store.commit()
+        return added
+
+    # ------------------------------------------------- OKF (plan §7)
+
+    def generate_okf(self) -> dict:
+        return OKFGenerator(self.store, self.cfg, self.llm).generate_all()
+
     # ---------------------------------------------------------------- all
 
     def run_mvp(self) -> dict:
+        """Hackathon MVP: jobs 1, 3, 4, 10."""
         out = {"dualmic_merged": self.job_dualmic() if self.ingestor else 0}
         out["duplicates_merged"] = self.job_dedup()
         out["contradictions_closed"] = self.job_contradictions()
         out["importance_updated"] = self.job_importance()
+        return out
+
+    def run_full(self) -> dict:
+        """The full Dream tier: MVP jobs + entity resolution, communities, the
+        summary ladder, archival, graph repair, LLM relations, and OKF regen."""
+        out = self.run_mvp()
+        out["entities_resolved"] = self.job_entity_resolution()
+        out["communities"] = self.job_communities()
+        out["summaries"] = self.job_summaries()
+        out["archived"] = self.job_archival()
+        out["graph_repaired"] = self.job_graph_repair()
+        out["llm_relations"] = self.job_llm_relations()
+        out["okf"] = self.generate_okf()
         return out

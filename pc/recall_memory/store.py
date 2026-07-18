@@ -129,6 +129,33 @@ CREATE INDEX IF NOT EXISTS idx_rel_memory ON relations(memory_id);
 CREATE VIRTUAL TABLE IF NOT EXISTS fts_chunks USING fts5(
   text, memory_id UNINDEXED
 );
+
+CREATE TABLE IF NOT EXISTS okf (
+  okf_id       INTEGER PRIMARY KEY AUTOINCREMENT,
+  source_type  TEXT NOT NULL,          -- meeting | github_repo | pdf
+  source_key   TEXT NOT NULL,          -- meeting_id | repo | document_title
+  manifest     TEXT NOT NULL,          -- JSON table-of-contents (plan §7)
+  content_hash TEXT NOT NULL,          -- staleness check for regeneration
+  generated_at INTEGER NOT NULL,
+  UNIQUE(source_type, source_key)
+);
+
+CREATE TABLE IF NOT EXISTS summaries (
+  summary_id  INTEGER PRIMARY KEY AUTOINCREMENT,
+  level       TEXT NOT NULL,           -- meeting | daily | project (ladder, §12 job 6)
+  scope_key   TEXT NOT NULL,           -- meeting_id | yyyy-mm-dd | project name
+  text        TEXT NOT NULL,
+  content_hash TEXT NOT NULL,
+  generated_at INTEGER NOT NULL,
+  UNIQUE(level, scope_key)
+);
+
+CREATE TABLE IF NOT EXISTS communities (
+  community_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  label        TEXT NOT NULL,          -- dominant shared entity/topic (§12 job 5)
+  member_ids   TEXT NOT NULL,          -- JSON list of memory_id
+  generated_at INTEGER NOT NULL
+);
 """
 
 _VEC_SCHEMA = f"""
@@ -150,9 +177,12 @@ def entity_id_for(text: str) -> str:
 
 
 class MemoryStore:
-    def __init__(self, db_path: str = ":memory:"):
-        self.db = sqlite3.connect(db_path)
+    def __init__(self, db_path: str = ":memory:", check_same_thread: bool = True):
+        # check_same_thread=False is used by the hub, which serializes access
+        # through a lock while handlers hop between event-loop and threadpool.
+        self.db = sqlite3.connect(db_path, check_same_thread=check_same_thread)
         self.db.row_factory = sqlite3.Row
+        self.db.execute("PRAGMA journal_mode=WAL")
         self.db.enable_load_extension(True)
         import sqlite_vec
         sqlite_vec.load(self.db)
@@ -458,6 +488,45 @@ class MemoryStore:
         self.db.execute("DELETE FROM memories WHERE memory_id=?", (memory_id,))
         self.commit()
         return {"episodes": n_ep, "chunks": len(chunk_ids)}
+
+    # ----------------------------------------------------- OKF / summaries
+
+    def upsert_okf(self, source_type: str, source_key: str, manifest: dict,
+                   content_hash: str):
+        self.db.execute(
+            """INSERT INTO okf(source_type, source_key, manifest, content_hash,
+                 generated_at) VALUES (?,?,?,?,?)
+               ON CONFLICT(source_type, source_key) DO UPDATE SET
+                 manifest=excluded.manifest, content_hash=excluded.content_hash,
+                 generated_at=excluded.generated_at""",
+            (source_type, source_key, json.dumps(manifest), content_hash, now_epoch()))
+
+    def get_okf(self, source_type: str, source_key: str) -> sqlite3.Row | None:
+        return self.db.execute(
+            "SELECT * FROM okf WHERE source_type=? AND source_key=?",
+            (source_type, source_key)).fetchone()
+
+    def upsert_summary(self, level: str, scope_key: str, text: str,
+                       content_hash: str):
+        self.db.execute(
+            """INSERT INTO summaries(level, scope_key, text, content_hash,
+                 generated_at) VALUES (?,?,?,?,?)
+               ON CONFLICT(level, scope_key) DO UPDATE SET
+                 text=excluded.text, content_hash=excluded.content_hash,
+                 generated_at=excluded.generated_at""",
+            (level, scope_key, text, content_hash, now_epoch()))
+
+    def get_summary(self, level: str, scope_key: str) -> sqlite3.Row | None:
+        return self.db.execute(
+            "SELECT * FROM summaries WHERE level=? AND scope_key=?",
+            (level, scope_key)).fetchone()
+
+    def replace_communities(self, communities: list[tuple[str, list[str]]]):
+        self.db.execute("DELETE FROM communities")
+        for label, members in communities:
+            self.db.execute(
+                "INSERT INTO communities(label, member_ids, generated_at) "
+                "VALUES (?,?,?)", (label, json.dumps(members), now_epoch()))
 
     # --------------------------------------------------------------- misc
 

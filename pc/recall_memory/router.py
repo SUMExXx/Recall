@@ -190,10 +190,11 @@ _PROTOTYPES = {
 
 class Router:
     def __init__(self, store: MemoryStore, cfg: RecallConfig | None = None,
-                 embedder=None):
+                 embedder=None, llm=None):
         self.store = store
         self.cfg = cfg or RecallConfig()
         self.embedder = embedder
+        self.llm = llm
         self._proto_vecs: dict[str, np.ndarray] | None = None
 
     def _prototypes(self) -> dict[str, np.ndarray]:
@@ -215,7 +216,8 @@ class Router:
 
     def _tier3(self, query: str) -> RoutePlan | None:
         """LLM planner: emits the plan JSON; validated, one retry, tier-1 fallback."""
-        import requests
+        if self.llm is None:
+            return None
         schema_hint = json.dumps({
             "query_type": "meeting|code|decision|timeline|general",
             "entities": ["..."],
@@ -226,14 +228,8 @@ class Router:
                   f"Query: {query}\nJSON only.")
         for _ in range(2):
             try:
-                r = requests.post(
-                    f"{self.cfg.ollama_url.rstrip('/')}/api/chat",
-                    json={"model": self.cfg.llm_model, "stream": False,
-                          "format": "json",
-                          "messages": [{"role": "user", "content": prompt}]},
-                    timeout=60)
-                r.raise_for_status()
-                plan = json.loads(r.json()["message"]["content"])
+                content = self.llm.generate(prompt, json=True, timeout=60)
+                plan = json.loads(content)
                 qt = plan.get("query_type", "general")
                 if qt not in QUERY_TYPES:
                     continue
@@ -257,7 +253,7 @@ class Router:
         plan = _tier1(query, self.store)
         if plan:
             return plan
-        if self.cfg.use_tier3_planner:
+        if self.cfg.use_tier3_planner and self.llm is not None and self.llm.available:
             plan = self._tier3(query)
             if plan:
                 return plan

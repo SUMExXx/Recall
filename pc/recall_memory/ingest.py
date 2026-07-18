@@ -9,9 +9,10 @@ from __future__ import annotations
 
 import time
 
+from .backends import get_backend
 from .chunker import build_transcript, chunk_document, chunk_meeting
 from .config import RecallConfig
-from .embeddings import get_embedder, matryoshka_coarse
+from .embeddings import matryoshka_coarse
 from .extractors import extract_decisions, extract_entities
 from .nmo import NMO, Chunk, Episode, new_id
 from .store import MemoryStore
@@ -19,10 +20,12 @@ from .store import MemoryStore
 
 class Ingestor:
     def __init__(self, store: MemoryStore, cfg: RecallConfig | None = None,
-                 embedder=None):
+                 backend=None):
         self.store = store
         self.cfg = cfg or RecallConfig()
-        self.embedder = embedder or get_embedder(self.cfg)
+        self.backend = backend or get_backend(self.cfg)
+        self.embedder = self.backend.embedder
+        self._tokenize = self.backend.tokenizer.tokenize
 
     # ------------------------------------------------------------ meetings
 
@@ -83,7 +86,7 @@ class Ingestor:
                     "subject": d["subject"], "predicate": d["predicate"],
                     "object": d["object"], "valid_at": int(ep.t_start)})
 
-        chunks = chunk_meeting(nmo, episodes)
+        chunks = chunk_meeting(nmo, episodes, self._tokenize)
         self._finish(nmo, chunks, episodes)
         return nmo.memory_id
 
@@ -95,7 +98,7 @@ class Ingestor:
         """pdf / text / note / image (image = pre-extracted OCR block)."""
         nmo = NMO.create(source_type=source_type, source=source, title=title,
                          content=content, source_meta=source_meta or {}, **kw)
-        chunks = chunk_document(nmo)
+        chunks = chunk_document(nmo, self._tokenize)
         self._finish(nmo, chunks, [])
         return nmo.memory_id
 
@@ -105,7 +108,7 @@ class Ingestor:
         nmo = NMO.create(source_type="github_repo", source="chrome_extension",
                          title=f"{repo}/{file_path}", content=content,
                          source_meta=meta, **kw)
-        chunks = chunk_document(nmo)
+        chunks = chunk_document(nmo, self._tokenize)
         self._finish(nmo, chunks, [])
         return nmo.memory_id
 

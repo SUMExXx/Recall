@@ -85,10 +85,26 @@ def extract_decisions(text: str, speaker: str = "") -> list[dict]:
     return out
 
 
-def llm_extract_relation(sentence: str, cfg=None) -> dict | None:
-    """Escalation hook for ambiguous spans (plan §6). Off by default.
+def llm_extract_relation(sentence: str, llm=None) -> dict | None:
+    """Escalation hook for ambiguous spans (plan §6): one (subject, predicate,
+    object) triple via the backend LLM (Qwen3-4B on the NPU, llama3.2 on Ollama).
 
-    Wire to the local LLM (Qwen3-4B on the event PC, llama3.2 via Ollama here)
-    with the single-sentence prompt: extract (subject, predicate, object).
+    Returns None when no LLM is available — the cheap extractors already handled
+    the confident cases, so this is a no-op on the offline/hash backend.
     """
+    if llm is None or not getattr(llm, "available", False):
+        return None
+    import json
+    try:
+        out = llm.generate(
+            "Extract exactly one (subject, predicate, object) triple from the "
+            'sentence as JSON: {"subject":"","predicate":"","object":""}. '
+            f"Sentence: {sentence}", json=True, timeout=60)
+        d = json.loads(out)
+    except Exception:
+        return None
+    if d.get("subject") and d.get("object"):
+        return {"subject": d["subject"],
+                "predicate": d.get("predicate", "related_to"),
+                "object": d["object"]}
     return None

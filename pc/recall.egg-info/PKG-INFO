@@ -1,0 +1,99 @@
+Metadata-Version: 2.4
+Name: recall
+Version: 2.0.0
+Summary: Recall — ambient, privacy-first, on-device AI memory companion (Snapdragon X Elite / NPU)
+License: Apache-2.0
+Requires-Python: >=3.12
+Description-Content-Type: text/markdown
+Requires-Dist: numpy>=1.26
+Requires-Dist: sqlite-vec>=0.1.7
+Requires-Dist: pydantic>=2.7
+Requires-Dist: pydantic-settings>=2.3
+Requires-Dist: fastapi>=0.115
+Requires-Dist: uvicorn[standard]>=0.30
+Requires-Dist: httpx>=0.27
+Requires-Dist: requests>=2.31
+Requires-Dist: mcp>=1.2
+Requires-Dist: tokenizers>=0.20
+Provides-Extra: npu
+Requires-Dist: onnxruntime-qnn; platform_machine == "ARM64" and extra == "npu"
+Requires-Dist: transformers>=4.44; extra == "npu"
+Requires-Dist: onnx>=1.16; extra == "npu"
+Provides-Extra: dev
+Requires-Dist: pytest>=8; extra == "dev"
+
+# Recall PC Hub — Memory Engine + Hub Layers
+
+Implements **`plans/memory_engineering_v2.md`** (memory engine) and the PC-hub
+backend layers of **`docs/system_architectures_v1.md` §4**: gateway (WS hub /
+REST / MCP), ASR workers, proactive recall, policy engine, device registry,
+supervisor, metrics, and the judge dashboard.
+
+## Layout
+
+| Module | Plan § | What it does |
+|---|---|---|
+| `recall_memory/nmo.py` | §3-4 | NMO + Episode + Chunk shapes, universal/source metadata, 3-group chunk metadata |
+| `recall_memory/store.py` | §4d | SQLite: memories, episodes, chunks, entity_mentions, relations (bi-temporal), FTS5, `vec_chunks` vec0 int8[256] |
+| `recall_memory/chunker.py` | §5 | Fixed token windows (meeting 256/15%, code 256/10%, pdf 400/12%, OCR whole-block), speaker-attribution rule |
+| `recall_memory/embeddings.py` | §2, §9 | Ollama nomic-embed-text (dev sub for AI Hub Nomic v1.5) + Matryoshka float[768] → int8[256]; deterministic hash fallback |
+| `recall_memory/extractors.py` | §6 | Cheap-first entity/decision/action-item extraction; LLM escalation hook |
+| `recall_memory/ingest.py` | §14a | Normalize → NMO → enrich → chunk → embed → write every index |
+| `recall_memory/router.py` | §8 | Tier 0 commands, tier 1 rules+filters, tier 2 embedding prototypes, tier 3 LLM plan JSON (off by default) |
+| `recall_memory/retrieval.py` | §9-11 | needs{}-gated parallel indices, weighted RRF k=60, recency/importance boost, float[768] rescore, reranker slot, small-to-big, cited answers |
+| `recall_memory/consolidate.py` | §12 | MVP jobs 1 (dedup), 3 (contradictions, bi-temporal), 4 (importance), 10 (dual-mic reconciliation) |
+| `recall_memory/cli.py` | — | `demo / ask / search / ingest-* / forget / consolidate / stats` |
+
+Hub layers (`docs/system_architectures_v1.md` §4):
+
+| Module | Arch box | What it does |
+|---|---|---|
+| `hub/app.py` | GW | Starlette gateway: WS hub (topics, seq numbers, resume tokens, binary PCM16 audio ingest), REST (`/ask /search /forget /consolidate /dump /links /digest /policy /health /stats /metrics /devices`), dashboard + capture pages |
+| `hub/registry.py` | REL | Device registry: heartbeats, 30 s leases, resume tokens |
+| `hub/asr.py` | NPU | ASRProvider workers (plan §2): whisper.cpp-contract local provider, Hinglish BYOM slot, policy-gated Sarvam stub, selection policy + fallback chain |
+| `hub/sessions.py` | CORE | Live meeting sessions: utterance buffering, bookmark, forget-last-N-min, ingest on `meeting_end` |
+| `hub/proactive.py` | CORE | Proactive recall: rolling 45 s window, threshold + 60 s cooldown → recall push + LED |
+| `hub/policy.py` | CORE | Privacy tags, cloud opt-in (default OFF), outbox for batch cloud jobs |
+| `hub/metrics.py` | REL | Bench logger: p50/p95 per stage (asr, proactive, ask_total, ingest…) |
+| `hub/mcp_server.py` | GW | stdio MCP server: `recall_search_memory, recall_ask, recall_bookmark_moment, recall_forget_range, recall_dump` |
+| `hub/dashboard/` | UI | Judge dashboard (virtual LED, memory-field canvas with similarity links, live transcript, proactive recall cards, ask, briefing, devices/bench) + `/capture` web-mic fallback |
+
+## Quick start
+
+```
+make setup          # venv + deps (numpy, sqlite-vec, requests, pytest)
+make test           # 37 tests (engine + hub), no Ollama needed (hash embedder)
+make demo           # seed sample cross-source data (uses Ollama if running)
+make ask Q="Who decided to use JWT authentication?"
+make consolidate    # dual-mic merge + dedup + contradictions + importance
+```
+
+Forget button:
+
+```
+.venv/Scripts/python -m recall_memory --db demo.db forget --meeting mtg-auth-sync --last-minutes 5
+```
+
+## Running the hub
+
+```
+.venv/Scripts/python scripts/run_hub.py        # seeds demo_hub.db, serves :8000
+```
+
+- Dashboard: http://localhost:8000 · web-mic fallback capture: http://localhost:8000/capture
+- Capture devices connect to `ws://<hub>:8000/ws`: `hello` → `meeting_start` →
+  `utterance` (text) or binary PCM16 frames (transcribed in ~6 s windows via
+  `RECALL_WHISPER_URL`) → `button` (bookmark / forget_last) → `meeting_end`.
+- MCP (Claude Desktop / Claude Code):
+  `claude mcp add recall -- <pc>/.venv/Scripts/python.exe -m hub.mcp_server --db <pc>/demo_hub.db`
+
+## Dev substitutes vs event PC (X Elite)
+
+| Role | Here (x64 laptop) | Event PC |
+|---|---|---|
+| Embeddings | Ollama `nomic-embed-text` (768-dim, same model family) | AI Hub Nomic v1.5, ORT-QNN, seqlen 256/512 re-export |
+| LLM (tier-3 planner + synthesis) | Ollama `llama3.2:3b` | Qwen3-4B-Instruct-2507 w4a16, GenieX |
+| Reranker | `PassthroughReranker` slot | Qwen3-Reranker-0.6B (bge-reranker CPU fallback) |
+| ASR | upstream (server/ from Recall 1.0) | Whisper-Base-En / Small-En, ORT-QNN |
+
+No code path changes — swap the provider classes in `embeddings.py` / `retrieval.py`.

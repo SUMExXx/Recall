@@ -1,0 +1,452 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Recall</title>
+<style>
+  :root{
+    --bg:#12100c; --surface:#1b1812; --line:#332d21; --ink:#ece7db; --muted:#a39b8a;
+    --amber:#f0a030; --blue:#7aa7f7; --green:#57c87b; --red:#e8837c;
+    --mono:"Cascadia Code","SF Mono",Consolas,ui-monospace,monospace;
+  }
+  *{box-sizing:border-box}
+  body{background:var(--bg); color:var(--ink); font-family:var(--mono); margin:0;
+       padding:20px; font-size:15px}
+  header{display:flex; align-items:center; gap:20px; margin-bottom:16px}
+  h1{font-size:22px; margin:0}
+  .sub{color:var(--muted); font-size:12px}
+  .spacer{flex:1}
+  .stats{font-size:13px; color:var(--muted)}
+  .stats b{color:var(--ink); font-variant-numeric:tabular-nums; font-size:18px}
+
+  /* virtual LED — mirrors the UNO Q light exactly */
+  .led{width:46px; height:46px; border-radius:50%; background:#3a352b;
+       box-shadow:0 0 0 0 transparent; flex:none}
+  .led.idle{animation:breathe 4s ease-in-out infinite}
+  .led.capturing{background:var(--amber); animation:pulseAmber 1s ease-in-out infinite}
+  .led.searching{background:var(--blue); animation:pulseBlue .8s ease-in-out infinite}
+  .led.recalled{background:var(--green); box-shadow:0 0 34px 6px rgba(87,200,123,.55)}
+  .led.muted{background:var(--red); box-shadow:0 0 18px 3px rgba(232,131,124,.5)}
+  .led.error{background:var(--red); animation:blinkRed 1s steps(1) infinite}
+  @keyframes breathe{0%,100%{background:#3a352b}50%{background:#565040}}
+  @keyframes pulseAmber{0%,100%{box-shadow:0 0 8px 2px rgba(240,160,48,.25)}50%{box-shadow:0 0 36px 10px rgba(240,160,48,.7)}}
+  @keyframes pulseBlue{0%,100%{box-shadow:0 0 8px 2px rgba(122,167,247,.25)}50%{box-shadow:0 0 36px 10px rgba(122,167,247,.7)}}
+  @keyframes blinkRed{0%,20%,40%{box-shadow:0 0 30px 8px rgba(232,131,124,.7)}10%,30%,50%,100%{box-shadow:none}}
+  .led-label{font-size:12px; color:var(--muted); text-align:center; margin-top:4px}
+
+  .card{background:var(--surface); border:1px solid var(--line); border-radius:10px;
+        padding:14px 16px}
+  .card h2{font-size:11px; text-transform:uppercase; letter-spacing:.08em;
+           color:var(--muted); margin:0 0 10px}
+
+  #viz-card{margin-bottom:16px}
+  #viz{width:100%; height:280px; display:block; cursor:pointer}
+  #viz-caption{font-size:12px; color:var(--muted); min-height:18px; margin-top:6px}
+
+  .grid{display:grid; grid-template-columns:1.4fr 1fr; gap:16px}
+  .col{display:flex; flex-direction:column; gap:16px}
+  #transcript{height:210px; overflow-y:auto; font-size:14px; line-height:1.7}
+  #transcript .line{padding:4px 0; border-bottom:1px solid var(--line)}
+  #transcript .t{color:var(--muted); font-size:11px; margin-right:8px}
+  #transcript .sp{color:var(--blue)}
+
+  #related-feed{display:flex; flex-direction:column; gap:8px; max-height:180px;
+                overflow-y:auto}
+  .related-card{border-left:3px solid var(--amber); background:rgba(240,160,48,.07);
+                padding:8px 12px; border-radius:0 6px 6px 0; font-size:13px}
+  .related-card .why{color:var(--muted); font-size:11px; margin-top:4px}
+  .empty{color:var(--muted); font-size:12px}
+
+  #query{width:100%; background:var(--bg); color:var(--ink); border:1px solid var(--line);
+         border-radius:6px; padding:9px 12px; font-family:var(--mono); font-size:14px}
+  #answer{margin-top:10px; font-size:14px; line-height:1.6}
+  .sources{margin-top:8px; font-size:12px; color:var(--muted); padding-left:18px}
+  .latency{color:var(--muted); font-size:11px}
+
+  button.act{background:var(--amber); color:var(--bg); border:none; border-radius:6px;
+             padding:9px 16px; font-family:var(--mono); font-weight:700; font-size:13px;
+             cursor:pointer}
+  button.act:disabled{opacity:.5}
+  #digest-out{margin-top:10px; font-size:13.5px; line-height:1.6}
+  .del-btn{margin-left:10px; padding:2px 10px; font:inherit; font-size:11.5px;
+           color:#e05555; background:transparent; border:1px solid rgba(224,85,85,.5);
+           border-radius:6px; cursor:pointer}
+  .del-btn:hover{background:rgba(224,85,85,.12)}
+  table{width:100%; border-collapse:collapse; font-size:12.5px}
+  td,th{padding:4px 6px; text-align:left; border-bottom:1px solid var(--line);
+        color:var(--muted)}
+  td:first-child{color:var(--ink)}
+  .ok{color:var(--green)} .bad{color:var(--red)}
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>Recall</h1>
+    <div class="sub">live memory · judge dashboard · <span id="conn">connecting…</span></div>
+  </div>
+  <div class="spacer"></div>
+  <div class="stats">memories <b id="mem-count">0</b></div>
+  <div class="stats" id="cloud-pill" title="cloud tier — policy-gated opt-in">☁ off</div>
+  <div>
+    <div class="led idle" id="led"></div>
+    <div class="led-label" id="led-label">idle</div>
+  </div>
+</header>
+
+<div class="card" id="viz-card">
+  <h2>Memory field — every dot is a memory · amber = forming · green = recalled · lines = related</h2>
+  <canvas id="viz"></canvas>
+  <div id="viz-caption">click a dot to read that memory</div>
+</div>
+
+<div class="grid">
+  <div class="col">
+    <div class="card">
+      <h2>Live transcript</h2>
+      <div id="transcript"><div class="empty">waiting for a capture device —
+        open <a href="/capture" style="color:var(--amber)">/capture</a> or stream
+        utterances over /ws</div></div>
+    </div>
+    <div class="card">
+      <h2>💡 Proactive recall — memories that surfaced themselves</h2>
+      <div id="related-feed"><div class="empty">as you talk, related older
+        memories will appear here unprompted</div></div>
+    </div>
+  </div>
+
+  <div class="col">
+    <div class="card">
+      <h2>Ask</h2>
+      <input id="query" placeholder="What did we decide about...?" />
+      <div id="answer"></div>
+    </div>
+    <div class="card">
+      <h2>Briefing</h2>
+      <button class="act" id="digest-btn">What did I talk about today?</button>
+      <div id="digest-out"></div>
+    </div>
+    <div class="card">
+      <h2>Devices &amp; bench</h2>
+      <table id="devices"></table>
+      <table id="bench" style="margin-top:8px"></table>
+    </div>
+  </div>
+</div>
+
+<script>
+const led = document.getElementById('led');
+const ledLabel = document.getElementById('led-label');
+const transcriptEl = document.getElementById('transcript');
+const memCount = document.getElementById('mem-count');
+const queryInput = document.getElementById('query');
+const answerEl = document.getElementById('answer');
+const relatedFeed = document.getElementById('related-feed');
+const digestBtn = document.getElementById('digest-btn');
+const digestOut = document.getElementById('digest-out');
+const cloudPill = document.getElementById('cloud-pill');
+const canvas = document.getElementById('viz');
+const ctx = canvas.getContext('2d');
+const vizCaption = document.getElementById('viz-caption');
+let lastSeq = 0, resumeToken = localStorage.getItem('resume') || null;
+
+function setState(s) { led.className = 'led ' + s; ledLabel.textContent = s; }
+
+// ------------------------------------------------------------- memory viz
+// Golden-angle spiral: organic layout, no collisions, order = time.
+const nodes = [];   // {id, text, ts, x, y, flash:{r,g,b,a}}
+let edges = [];     // {a, b, score}
+let selectedId = null;
+let sweepPhase = -1;
+
+let linksTimer = null;
+function refreshLinks() {
+  clearTimeout(linksTimer);
+  linksTimer = setTimeout(async () => {
+    try { edges = await (await fetch('/links?threshold=0.55')).json(); }
+    catch (e) {}
+  }, 400);
+}
+
+function layoutPos(i, count, w, h) {
+  const cx = w / 2, cy = h / 2;
+  const maxR = Math.min(w, h) / 2 - 14;
+  const c = maxR / Math.sqrt(Math.max(count, 30));
+  const r = c * Math.sqrt(i + 0.5);
+  const th = (i + 1) * 2.39996;   // golden angle
+  return [cx + r * Math.cos(th), cy + r * Math.sin(th)];
+}
+
+function addNode(m, flash) {
+  if (nodes.some(n => n.id === m.id)) return;
+  nodes.push({id: m.id, text: m.text, ts: m.ts,
+              flash: flash ? {r: 240, g: 160, b: 48, a: 1} : null});
+  memCount.textContent = nodes.length;
+}
+
+function flashNodes(ids, color) {
+  for (const n of nodes) if (ids.includes(n.id)) n.flash = {...color, a: 1};
+}
+
+function removeNode(id) {
+  const i = nodes.findIndex(n => n.id === id);
+  if (i >= 0) nodes.splice(i, 1);
+  edges = edges.filter(e => e.a !== id && e.b !== id);
+  if (selectedId === id) {
+    selectedId = null;
+    vizCaption.textContent = 'click a dot to read that memory';
+  }
+  memCount.textContent = nodes.length;
+}
+
+function draw() {
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  if (canvas.width !== w * devicePixelRatio) {
+    canvas.width = w * devicePixelRatio;
+    canvas.height = h * devicePixelRatio;
+  }
+  ctx.setTransform(devicePixelRatio, 0, 0, devicePixelRatio, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+
+  if (sweepPhase >= 0) {           // searching: expanding blue ring
+    sweepPhase = (sweepPhase + 2.5) % (Math.min(w, h) / 2 + 40);
+    ctx.beginPath();
+    ctx.arc(w / 2, h / 2, sweepPhase, 0, Math.PI * 2);
+    ctx.strokeStyle = 'rgba(122,167,247,0.35)';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+  }
+
+  nodes.forEach((n, i) => {
+    const [x, y] = layoutPos(i, nodes.length, w, h);
+    n.x = x; n.y = y;
+  });
+
+  // constellation lines beneath the dots
+  const byId = Object.fromEntries(nodes.map(n => [n.id, n]));
+  for (const e of edges) {
+    const a = byId[e.a], b = byId[e.b];
+    if (!a || !b) continue;
+    const touched = selectedId && (e.a === selectedId || e.b === selectedId);
+    ctx.beginPath();
+    ctx.moveTo(a.x, a.y);
+    ctx.lineTo(b.x, b.y);
+    ctx.strokeStyle = touched
+      ? `rgba(240,160,48,${0.35 + 0.5 * Math.max(0, e.score - 0.55)})`
+      : `rgba(163,155,138,${0.08 + 0.3 * Math.max(0, e.score - 0.55)})`;
+    ctx.lineWidth = touched ? 1.5 : 1;
+    ctx.stroke();
+  }
+
+  for (const n of nodes) {
+    if (n.id === selectedId) {
+      ctx.beginPath();
+      ctx.arc(n.x, n.y, 9, 0, Math.PI * 2);
+      ctx.strokeStyle = 'rgba(240,160,48,0.9)';
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+    }
+    ctx.beginPath();
+    ctx.arc(n.x, n.y, 4, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(163,155,138,0.5)';
+    ctx.fill();
+    if (n.flash && n.flash.a > 0.02) {
+      const f = n.flash;
+      ctx.beginPath();
+      ctx.arc(n.x, n.y, 4 + 10 * f.a, 0, Math.PI * 2);
+      ctx.fillStyle = `rgba(${f.r},${f.g},${f.b},${0.55 * f.a})`;
+      ctx.fill();
+      ctx.beginPath();
+      ctx.arc(n.x, n.y, 4, 0, Math.PI * 2);
+      ctx.fillStyle = `rgba(${f.r},${f.g},${f.b},${Math.min(1, 0.4 + f.a)})`;
+      ctx.fill();
+      f.a *= 0.975;
+    }
+  }
+  requestAnimationFrame(draw);
+}
+requestAnimationFrame(draw);
+
+canvas.addEventListener('click', (ev) => {
+  const rect = canvas.getBoundingClientRect();
+  const mx = ev.clientX - rect.left, my = ev.clientY - rect.top;
+  let best = null, bestD = 18;
+  for (const n of nodes) {
+    const d = Math.hypot(n.x - mx, n.y - my);
+    if (d < bestD) { bestD = d; best = n; }
+  }
+  selectedId = best ? best.id : null;
+  if (best) {
+    const related = edges.filter(e => e.a === best.id || e.b === best.id).length;
+    vizCaption.innerHTML =
+      `"${esc(best.text)}" — ${new Date(best.ts * 1000).toLocaleString()}` +
+      (related ? ` · linked to ${related} memor${related === 1 ? 'y' : 'ies'}` : '') +
+      ` <button class="del-btn" id="del-mem">forget this</button>`;
+    document.getElementById('del-mem').onclick = () => deleteMemory(best.id);
+  } else {
+    vizCaption.textContent = 'click a dot to read that memory';
+  }
+});
+
+async function deleteMemory(id) {
+  try {
+    await fetch('/forget', {method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({memory_id: id})});
+    removeNode(id);
+    refreshLinks();
+  } catch (e) {}
+}
+
+// -------------------------------------------------------------- feeds ----
+function addTranscriptLine(d) {
+  if (transcriptEl.querySelector('.empty')) transcriptEl.innerHTML = '';
+  const line = document.createElement('div');
+  line.className = 'line';
+  const t = new Date((d.t_start || Date.now() / 1000) * 1000).toLocaleTimeString();
+  line.innerHTML = `<span class="t">${t}</span>` +
+    (d.speaker ? `<span class="sp">${esc(d.speaker)}</span>: ` : '') +
+    esc(d.text || d.error || '');
+  transcriptEl.appendChild(line);
+  transcriptEl.scrollTop = transcriptEl.scrollHeight;
+}
+
+function addRelatedCard(d) {
+  if (relatedFeed.querySelector('.empty')) relatedFeed.innerHTML = '';
+  const card = document.createElement('div');
+  card.className = 'related-card';
+  card.innerHTML = `💡 "${esc(d.snippet)}"<div class="why">surfaced because you ` +
+    `just said: "${esc((d.new_text || d.window || '').slice(0, 90))}…" · ` +
+    `${esc(d.citation)} · similarity ${Number(d.score).toFixed(2)}</div>`;
+  relatedFeed.prepend(card);
+  while (relatedFeed.children.length > 5) relatedFeed.lastChild.remove();
+  flashNodes([d.memory_id], {r: 240, g: 160, b: 48});
+}
+
+function renderAnswer(out) {
+  let html = `<div>${esc(out.answer || out.error ||
+    JSON.stringify(out.command))}</div>` +
+    `<div class="latency">${out.latency_ms} ms` +
+    (out.plan ? ` · tier ${out.plan.tier} · ${esc(out.plan.query_type)} · ` +
+      `${esc(out.plan.path)} path` : '') + `</div>`;
+  if (out.sources && out.sources.length) {
+    html += '<ul class="sources">' + out.sources.map(s =>
+      `<li>${esc(s.citation)} ${esc(s.source_type)}: "${esc(s.title)}" — ` +
+      `${Number(s.score).toFixed(2)}</li>`).join('') + '</ul>';
+    flashNodes(out.sources.map(s => s.memory_id), {r: 87, g: 200, b: 123});
+  }
+  answerEl.innerHTML = html;
+}
+
+function renderDevices(devs) {
+  document.getElementById('devices').innerHTML =
+    devs.map(d => `<tr><td>${esc(d.device_id)}</td><td>${esc(d.role)}</td>` +
+      `<td class="${d.connected ? 'ok' : 'bad'}">` +
+      `${d.connected ? 'online' : 'offline'}</td></tr>`).join('');
+}
+
+// -------------------------------------------------------------- events ---
+function connect() {
+  const ws = new WebSocket(`ws://${location.host}/ws`);
+  ws.onopen = () => {
+    document.getElementById('conn').textContent = 'connected';
+    ws.send(JSON.stringify({type: 'hello', device_id: 'dashboard',
+      role: 'dashboard', resume_token: resumeToken, last_seq: lastSeq}));
+    setInterval(() => ws.readyState === 1 &&
+      ws.send(JSON.stringify({type: 'heartbeat'})), 10000);
+  };
+  ws.onclose = () => {
+    document.getElementById('conn').textContent = 'reconnecting…';
+    setTimeout(connect, 2000);
+  };
+  ws.onmessage = (e) => {
+    const m = JSON.parse(e.data);
+    if (m.type === 'welcome') {
+      resumeToken = m.resume_token;
+      localStorage.setItem('resume', resumeToken);
+      setState(m.led_state);
+      (m.missed || []).forEach(handleEvent);
+    } else if (m.type === 'event') handleEvent(m);
+  };
+}
+
+function handleEvent(m) {
+  lastSeq = Math.max(lastSeq, m.seq);
+  const d = m.data;
+  if (m.topic === 'led_state') {
+    setState(d.state);
+    sweepPhase = d.state === 'searching' ? 0 : -1;
+  }
+  else if (m.topic === 'transcript') addTranscriptLine(d);
+  else if (m.topic === 'recall') addRelatedCard(d);
+  else if (m.topic === 'answer') renderAnswer(d);
+  else if (m.topic === 'device_health') renderDevices(d.devices);
+  else if (m.topic === 'memory_added') { loadMemories(); refreshLinks(); }
+  else if (m.topic === 'memory_deleted') { removeNode(d.memory_id); }
+}
+connect();
+
+// ---------------------------------------------------------------- ask ----
+queryInput.addEventListener('keydown', async (e) => {
+  if (e.key !== 'Enter' || !queryInput.value.trim()) return;
+  const query = queryInput.value.trim();
+  queryInput.value = '';
+  answerEl.textContent = '…';
+  const r = await fetch('/ask', {method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({query})});
+  renderAnswer(await r.json());
+});
+
+// -------------------------------------------------------------- digest ---
+digestBtn.addEventListener('click', async () => {
+  digestBtn.disabled = true;
+  digestOut.textContent = 'thinking…';
+  try {
+    const out = await (await fetch('/digest', {method: 'POST'})).json();
+    digestOut.textContent =
+      `${out.digest}  (${out.count} memories, ${out.latency_ms} ms)`;
+  } catch (e) {
+    digestOut.textContent = 'digest failed — is the hub up?';
+  } finally { digestBtn.disabled = false; }
+});
+
+// ------------------------------------------------------ initial population
+async function loadMemories() {
+  try {
+    const mems = await (await fetch('/dump')).json();
+    mems.filter(m => !m.archived).reverse().forEach(m =>
+      addNode({id: m.memory_id, text: m.title, ts: m.created_at}, false));
+  } catch (e) {}
+}
+
+async function refreshBench() {
+  try {
+    const [st, me, pol] = await Promise.all([
+      fetch('/stats').then(r => r.json()),
+      fetch('/metrics').then(r => r.json()),
+      fetch('/policy').then(r => r.json())]);
+    const rows = [`<tr><td>chunks</td><td>${st.chunks}</td></tr>`,
+                  `<tr><td>episodes</td><td>${st.episodes}</td></tr>`,
+                  `<tr><td>embedder</td><td>${esc(st.embedder)}</td></tr>`];
+    for (const [stage, s] of Object.entries(me.stages || {}))
+      rows.push(`<tr><td>${esc(stage)}</td><td>p50 ${s.p50_ms} ms · ` +
+        `p95 ${s.p95_ms} ms (n=${s.n})</td></tr>`);
+    document.getElementById('bench').innerHTML = rows.join('');
+    cloudPill.textContent = pol.cloud_optin
+      ? `☁ on${pol.outbox_pending ? ` · ${pol.outbox_pending} pending` : ''}`
+      : '☁ off';
+    cloudPill.style.color = pol.cloud_optin ? 'var(--green)' : '';
+  } catch (e) { /* hub restarting */ }
+}
+
+function esc(s) { const d = document.createElement('div');
+  d.textContent = s ?? ''; return d.innerHTML; }
+
+loadMemories().then(refreshLinks);
+refreshBench();
+setInterval(refreshBench, 5000);
+</script>
+</body>
+</html>

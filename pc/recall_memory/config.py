@@ -1,18 +1,31 @@
-"""Central configuration for the Recall memory engine.
+"""Central configuration for the Recall memory engine (pydantic-settings).
 
-Values mirror plans/memory_engineering_v2.md. On the dev laptop the embedder and
-LLM are Ollama substitutes (nomic-embed-text / llama3.2:3b); on the X Elite event
-PC they map to the AI Hub Nomic v1.5 NPU asset and Qwen3-4B via GenieX.
+The whole dev-laptop-vs-event-PC story collapses into ONE switch: `backend`.
+
+    RECALL_BACKEND=npu      Snapdragon X Elite event PC   (DEFAULT — the real target)
+    RECALL_BACKEND=ollama   your laptop, via Ollama       (local development)
+    RECALL_BACKEND=hash     deterministic offline stub    (tests / CI, no models)
+
+Everything else (model names, service URLs, thresholds) is a field on
+`RecallConfig` and overridable from the environment with the `RECALL_` prefix,
+e.g. `RECALL_OLLAMA_URL`, `RECALL_NPU_LLM_ENDPOINT`, `RECALL_DB_PATH`.
+
+The domain constants below (dimensions, chunk specs, RRF weight profiles) are
+fixed by plans/memory_engineering_v2.md and are NOT environment config.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from typing import Literal
 
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 PROCESSING_VERSION = "v2.0"
 
 DIM_FULL = 768     # Nomic-Embed-Text v1.5 output
 DIM_COARSE = 256   # Matryoshka truncation for the hot int8 scan
+
+Backend = Literal["npu", "ollama", "hash"]
 
 
 @dataclass(frozen=True)
@@ -63,18 +76,43 @@ WEIGHT_PROFILES: dict[str, dict] = {
 RECENCY_HALF_LIFE_DAYS = 30.0
 
 COARSE_TOPK = 200   # coarse-scan hits rescored with float[768]
-RERANK_TOPK = 50    # slice handed to the (stub) cross-encoder reranker
+RERANK_TOPK = 50    # slice handed to the cross-encoder reranker
 ANSWER_TOPK = 6     # contexts handed to the LLM
 
 
-@dataclass
-class RecallConfig:
+class RecallConfig(BaseSettings):
+    """Runtime configuration. Reads `RECALL_*` env vars; kwargs override env."""
+
+    model_config = SettingsConfigDict(
+        env_prefix="RECALL_", extra="ignore", populate_by_name=True)
+
+    # --- the one switch --------------------------------------------------
+    backend: Backend = "npu"
+
     db_path: str = "recall.db"
-    ollama_url: str = "http://localhost:11434"
-    embed_model: str = "nomic-embed-text"
-    llm_model: str = "llama3.2:3b"
-    use_tier3_planner: bool = False   # off by default, per plan recommendation #3
-    embedder: str = "auto"            # auto | ollama | hash
+
+    # --- router / retrieval / consolidation knobs ------------------------
+    use_tier3_planner: bool = False          # off by default (plan rec. #3)
     near_dup_cosine: float = 0.95
     dualmic_fuzzy_threshold: float = 0.85
-    extra: dict = field(default_factory=dict)
+
+    # --- ollama backend (local dev) --------------------------------------
+    ollama_url: str = "http://localhost:11434"
+    ollama_embed_model: str = "nomic-embed-text"   # 768-dim, same family as Nomic v1.5
+    ollama_llm_model: str = "llama3.2:3b"
+
+    # --- npu backend (Snapdragon X Elite) --------------------------------
+    # Embedder: Nomic-Embed-Text v1.5 re-exported at seqlen 256/512, ORT-QNN.
+    npu_embed_onnx_256: str = "models/nomic-v1.5-seq256.onnx"
+    npu_embed_onnx_512: str = "models/nomic-v1.5-seq512.onnx"
+    # LLM: Qwen3-4B-Instruct-2507 (w4a16) served by GenieX/QAIRT over HTTP.
+    npu_llm_endpoint: str = "http://localhost:8090"
+    npu_llm_model: str = "qwen3-4b-instruct-2507"
+    # Reranker: Qwen3-Reranker-0.6B via ORT-QNN (bge-reranker CPU fallback).
+    npu_reranker_onnx: str = "models/qwen3-reranker-0.6b.onnx"
+    # HF tokenizer id used for exact on-device token budgeting.
+    npu_tokenizer_id: str = "Qwen/Qwen3-4B"
+
+    # --- ASR services (shared; the backend points these at the right one) -
+    whisper_url: str = "http://localhost:8080"     # Whisper-Base-En (dev: whisper.cpp)
+    hinglish_url: str = "http://localhost:8081"    # Oriserve Hinglish BYOM slot

@@ -8,6 +8,7 @@ import pytest
 from recall_memory.chunker import chunk_document, chunk_meeting
 from recall_memory.config import CHUNK_SPECS, DIM_COARSE, DIM_FULL, RecallConfig
 from recall_memory.consolidate import Consolidator
+from recall_memory.okf import OKFGenerator
 from recall_memory.demo_data import (SAMPLE_GITHUB, SAMPLE_OCR, SAMPLE_PDF,
                                      sample_meeting, sample_meeting_phone, seed)
 from recall_memory.embeddings import HashEmbedder, matryoshka_coarse
@@ -21,7 +22,7 @@ from recall_memory.tokenizer import count_tokens, tokenize
 
 @pytest.fixture()
 def cfg():
-    return RecallConfig(db_path=":memory:", embedder="hash")
+    return RecallConfig(db_path=":memory:", backend="hash")
 
 
 @pytest.fixture()
@@ -33,7 +34,7 @@ def store():
 
 @pytest.fixture()
 def ingestor(store, cfg):
-    return Ingestor(store, cfg, HashEmbedder())
+    return Ingestor(store, cfg)
 
 
 @pytest.fixture()
@@ -194,7 +195,7 @@ def test_router_tier2_fallthrough(seeded):
 
 def test_retrieval_finds_decision(seeded):
     store, cfg, ing, ids = seeded
-    r = Retriever(store, cfg, ing.embedder)
+    r = Retriever(store, cfg, ing.backend)
     ctxs = r.retrieve("Who decided to use JWT authentication?")
     assert ctxs
     joined = " ".join(c.text.lower() for c in ctxs)
@@ -206,7 +207,7 @@ def test_retrieval_finds_decision(seeded):
 
 def test_cross_source_bridge(seeded):
     store, cfg, ing, _ = seeded
-    r = Retriever(store, cfg, ing.embedder)
+    r = Retriever(store, cfg, ing.backend)
     ctxs = r.retrieve("JWT", top_k=10)
     types = {c.source_type for c in ctxs}
     assert {"meeting", "github_repo", "pdf"} <= types, f"got {types}"
@@ -214,7 +215,7 @@ def test_cross_source_bridge(seeded):
 
 def test_speaker_filtered_retrieval(seeded):
     store, cfg, ing, _ = seeded
-    r = Retriever(store, cfg, ing.embedder)
+    r = Retriever(store, cfg, ing.backend)
     ctxs = r.retrieve("What did Ananya say about PostgreSQL?")
     assert ctxs
     meeting_ctxs = [c for c in ctxs if c.source_type == "meeting"]
@@ -309,12 +310,89 @@ def test_dualmic_reconciliation(seeded):
     assert eps[-1]["asr_confidence"] == pytest.approx(0.71)
 
 
+# ------------------------------------------------------------------ OKF
+
+def test_okf_generation(seeded):
+    store, cfg, ing, _ = seeded
+    counts = OKFGenerator(store, cfg).generate_all()
+    assert counts["meeting"] >= 1 and counts["github_repo"] >= 1
+    mtg = store.get_okf("meeting", "mtg-auth-sync")
+    assert mtg is not None
+    manifest = json.loads(mtg["manifest"])
+    assert "jwt" in " ".join(manifest["decisions"]).lower()
+    repo = store.get_okf("github_repo", "recall-backend")
+    assert repo is not None
+    files = json.loads(repo["manifest"])["files"]
+    assert any("jwt_middleware.py" in f for f in files)
+
+
+def test_okf_regeneration_is_incremental(seeded):
+    store, cfg, ing, _ = seeded
+    gen = OKFGenerator(store, cfg)
+    gen.generate_all()
+    # nothing changed -> second pass regenerates nothing
+    assert gen.generate_all() == {"github_repo": 0, "meeting": 0, "pdf": 0}
+
+
+def test_okf_skim_prepended_when_source_dominates(store, cfg, ingestor):
+    ingestor.ingest_meeting(sample_meeting())          # meeting-only store
+    OKFGenerator(store, cfg).generate_all()
+    r = Retriever(store, cfg, ingestor.backend)
+    out = r.ask("who decided to use JWT authentication?")
+    assert out["okf"] is not None
+    assert out["okf"]["meeting_id"] == "mtg-auth-sync"
+
+
+# ------------------------------------------------ full Dream tier (jobs 2/5/6/8/9)
+
+def test_entity_resolution_merges_variants(store, cfg, ingestor):
+    mid = ingestor.ingest_document("text", "n", "placeholder about databases")
+    cid = store.db.execute(
+        "SELECT chunk_id FROM chunks WHERE memory_id=? LIMIT 1", (mid,)).fetchone()["chunk_id"]
+    store.add_entity_mention("PostgreSQL", "identifier", cid, mid)
+    store.add_entity_mention("Postgres", "proper_noun", cid, mid)
+    store.commit()
+    assert Consolidator(store, cfg, ingestor).job_entity_resolution() >= 1
+    canon = store.db.execute(
+        "SELECT DISTINCT entity_id FROM entity_mentions "
+        "WHERE entity_text IN ('PostgreSQL','Postgres') OR entity_id IN "
+        "(SELECT entity_id FROM entity_mentions WHERE memory_id=?)", (mid,)).fetchall()
+    ids = {r["entity_id"] for r in store.db.execute(
+        "SELECT entity_id FROM entity_mentions WHERE memory_id=?", (mid,))}
+    assert len(ids) == 1               # both variants collapsed to one id
+
+
+def test_communities_cluster_shared_entities(seeded):
+    store, cfg, ing, _ = seeded
+    n = Consolidator(store, cfg, ing).job_communities()
+    assert n >= 1                       # JWT bridges the cross-source memories
+    rows = store.db.execute("SELECT * FROM communities").fetchall()
+    assert rows and json.loads(rows[0]["member_ids"])
+
+
+def test_summary_ladder(seeded):
+    store, cfg, ing, _ = seeded
+    assert Consolidator(store, cfg, ing).job_summaries() >= 1
+    s = store.get_summary("meeting", "mtg-auth-sync")
+    assert s is not None and "jwt" in s["text"].lower()
+
+
+def test_run_full_reports_every_job(seeded):
+    store, cfg, ing, _ = seeded
+    out = Consolidator(store, cfg, ing).run_full()
+    for key in ("dualmic_merged", "duplicates_merged", "contradictions_closed",
+                "importance_updated", "entities_resolved", "communities",
+                "summaries", "archived", "graph_repaired", "llm_relations", "okf"):
+        assert key in out
+    assert out["graph_repaired"] == 0   # nothing orphaned in a clean store
+
+
 # -------------------------------------------------------------- ask (offline)
 
 def test_ask_offline_fallback(seeded, monkeypatch):
     store, cfg, ing, _ = seeded
     cfg.ollama_url = "http://localhost:1"   # unreachable -> fallback path
-    r = Retriever(store, cfg, ing.embedder)
+    r = Retriever(store, cfg, ing.backend)
     out = r.ask("Who decided to use JWT authentication?")
     assert out["contexts"]
     assert "LLM unavailable" in out["answer"] or "NOTFOUND" not in out["answer"]
