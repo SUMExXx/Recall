@@ -1,0 +1,9 @@
+Recall: Recall is a multi-device AI memory companion that continuously captures, understands, and retrieves conversations, transforming everyday interactions into a searchable, contextual memory. Instead of relying on manual notes or recordings, Recall builds a living memory that helps users instantly recall decisions, discussions, and important details.
+
+Built for the Snapdragon Multiverse, Recall distributes intelligence across a Snapdragon AI PC, Snapdragon smartphone, Arduino UNO Q, and Qualcomm AI Cloud to deliver a seamless, privacy-first experience. The smartphone captures ambient conversations while performing lightweight on-device preprocessing. The Snapdragon AI PC transcribes speech, extracts semantic meaning, stores contextual embeddings in a local vector database, and uses an on-device language model to answer natural-language questions such as "What did we decide about the API?" or "Who suggested using WebSockets?"
+
+An Arduino-powered ambient memory light makes AI cognition visible in the physical world. The light glows amber while new memories are being formed, blue while searching, and green when relevant memories are successfully retrieved creating an intuitive interaction that extends beyond the screen.
+
+Unlike traditional note-taking apps, Recall works passively in the background, preserving context without interrupting conversations. Cloud synchronization securely extends memory across devices while keeping real-time inference fast and local.
+
+Recall showcases the power of the Snapdragon ecosystem by distributing sensing, AI reasoning, memory retrieval, and physical interaction across multiple devices. It introduces a new category of ambient AI where your conversations become an intelligent, searchable memory that is always available when you need it.
