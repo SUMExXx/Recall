@@ -14,9 +14,13 @@ class HomePage extends StatefulWidget {
   State<HomePage> createState() => _HomePageState();
 }
 
-class _HomePageState extends State<HomePage> {
+class _HomePageState extends State<HomePage>
+    with SingleTickerProviderStateMixin {
   MemoryPipeline? _pipe;
   String? _initError;
+
+  late final TabController _tabs = TabController(length: 2, vsync: this)
+    ..addListener(() => setState(() {}));
 
   final _queryController = TextEditingController();
   final _nameController = TextEditingController(text: 'Me');
@@ -337,6 +341,7 @@ class _HomePageState extends State<HomePage> {
     _nameController.dispose();
     _askController.dispose();
     _chatScroll.dispose();
+    _tabs.dispose();
     _chat?.dispose();
     _pipe?.dispose();
     super.dispose();
@@ -373,10 +378,9 @@ class _HomePageState extends State<HomePage> {
   /// Main UI once models are loaded and a speaker is enrolled: two tabs
   /// (Memories, Ask) plus the global capture Start/Stop button.
   Widget _buildReady() {
-    return DefaultTabController(
-      length: 2,
-      child: Scaffold(
-        appBar: AppBar(
+    final onMemoriesTab = _tabs.index == 0;
+    return Scaffold(
+      appBar: AppBar(
           title: const Text('Recall'),
           actions: [
             IconButton(
@@ -405,22 +409,25 @@ class _HomePageState extends State<HomePage> {
               icon: const Icon(Icons.delete_sweep),
             ),
           ],
-          bottom: const TabBar(
-            tabs: [
-              Tab(text: 'Memories', icon: Icon(Icons.list)),
-              Tab(text: 'Ask', icon: Icon(Icons.question_answer)),
-            ],
-          ),
-        ),
-        body: TabBarView(
-          children: [_buildBody(), _buildAsk()],
-        ),
-        floatingActionButton: FloatingActionButton.extended(
-          onPressed: _toggleCapture,
-          icon: Icon(_capturing ? Icons.stop : Icons.mic),
-          label: Text(_capturing ? 'Stop' : 'Start'),
+        bottom: TabBar(
+          controller: _tabs,
+          tabs: const [
+            Tab(text: 'Memories', icon: Icon(Icons.list)),
+            Tab(text: 'Ask', icon: Icon(Icons.question_answer)),
+          ],
         ),
       ),
+      body: TabBarView(
+        controller: _tabs,
+        children: [_buildBody(), _buildAsk()],
+      ),
+      floatingActionButton: onMemoriesTab
+          ? FloatingActionButton.extended(
+              onPressed: _toggleCapture,
+              icon: Icon(_capturing ? Icons.stop : Icons.mic),
+              label: Text(_capturing ? 'Stop' : 'Start'),
+            )
+          : null,
     );
   }
 
