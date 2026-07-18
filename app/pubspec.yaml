@@ -1,0 +1,35 @@
+name: recall
+description: "On-device AI memory: capture speech, recognize the speaker, transcribe, and store searchable memories."
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.7.2
+
+dependencies:
+  flutter:
+    sdk: flutter
+  cupertino_icons: ^1.0.8
+
+  sherpa_onnx: ^1.13.4        # VAD, speaker embeddings, Whisper ASR (native, offline)
+  onnxruntime: ^1.4.1         # bge text embeddings for semantic search
+  # 0.7.3-dev is the only mic_stream that uses Flutter v2 embedding (0.7.2 uses the
+  # removed PluginRegistry.Registrar API and won't compile on Flutter 3.29+).
+  mic_stream: 0.7.3-dev       # microphone PCM16 streaming (handles mic permission)
+  sqflite: ^2.3.0             # local memory store
+  path: ^1.9.0
+  path_provider: ^2.1.0
+  web_socket_channel: ^2.4.0  # sync memories to the PC hub
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/models/whisper/
+    - assets/models/vad/
+    - assets/models/speaker/
+    - assets/models/embed/
