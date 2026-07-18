@@ -5,9 +5,9 @@
 // Recall — Arduino UNO Q, MCU (real-time) side.
 // Implements the "MCU Side" of Architecture doc section 2:
 //   * LED state machine (capturing / searching / recalled / muted / error)
-//   * Buttons: tap = bookmark, hold 3 s = forget last 5 min
-//   * Hardware mute switch (GPIO mic gate — physical privacy)
 //   * MCU watchdog: error blink if the Linux side goes silent
+// (Push-button bookmark/forget and the hardware mute switch are intentionally
+//  not implemented; the "muted" LED state is still driven by the hub.)
 //
 // The 12x8 LED matrix is monochrome, so the spec's colours are mapped to
 // distinct patterns:  amber(capturing)=solid block, blue(searching)=checker,
@@ -33,21 +33,10 @@ enum LedState {
   LED_ERROR     = 5,   // red   -> full blink
 };
 
-// ---- Pins (adjust to your wiring) -----------------------------------------
-const int PIN_BUTTON = 2;   // tap = bookmark, hold 3 s = forget last 5 min
-const int PIN_MUTE   = 3;   // hardware mute switch (mic gate), active-low
-
 // ---- State ----------------------------------------------------------------
 volatile int  gLedState  = LED_IDLE;
 volatile bool gDirty     = true;    // LED needs a re-render
 volatile bool gAnimating = false;   // heart flourish is playing; don't repaint
-bool gMuted = false;
-
-// Button timing
-const unsigned long HOLD_MS = 3000;
-bool          gBtnDown   = false;
-bool          gHoldFired = false;
-unsigned long gBtnDownMs = 0;
 
 // Watchdog: blink error if the Linux side stops talking to us
 const unsigned long BRIDGE_TIMEOUT_MS = 8000;
@@ -144,9 +133,6 @@ void setup() {
   matrix.clear();
   matrix.loadFrame(HeartStatic);
 
-  pinMode(PIN_BUTTON, INPUT_PULLUP);
-  pinMode(PIN_MUTE, INPUT_PULLUP);
-
   Bridge.begin();
   Bridge.provide("keyword_detected", wake_up);          // existing
   Bridge.provide_safe("set_led_state", set_led_state);  // touches the matrix
@@ -157,29 +143,6 @@ void setup() {
 
 void loop() {
   unsigned long now = millis();
-
-  // ---- Hardware mute switch (active-low) ----
-  bool muted = (digitalRead(PIN_MUTE) == LOW);
-  if (muted != gMuted) {
-    gMuted = muted;
-    Bridge.notify("mute_changed", gMuted);   // tell Linux to gate the mic
-    gLedState = gMuted ? LED_MUTED : LED_IDLE;
-    gDirty = true;
-  }
-
-  // ---- Button: tap = bookmark, hold 3 s = forget last 5 min ----
-  bool pressed = (digitalRead(PIN_BUTTON) == LOW);
-  if (pressed && !gBtnDown) {
-    gBtnDown = true;
-    gHoldFired = false;
-    gBtnDownMs = now;
-  } else if (pressed && gBtnDown && !gHoldFired && (now - gBtnDownMs >= HOLD_MS)) {
-    gHoldFired = true;                        // fire once at the 3 s mark
-    Bridge.notify("button_event", "forget");
-  } else if (!pressed && gBtnDown) {
-    gBtnDown = false;
-    if (!gHoldFired) Bridge.notify("button_event", "bookmark");
-  }
 
   // ---- MCU watchdog: blink error if the Linux side went silent ----
   if (gEverHeard && (now - gLastBridgeMs > BRIDGE_TIMEOUT_MS)) {

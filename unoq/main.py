@@ -8,16 +8,17 @@
 #   client -> hub : hello{device_id, role, resume_token?, last_seq?}
 #                   heartbeat{} | subscribe{topics[]}
 #                   meeting_start{capture_device} -> <binary PCM16 frames> -> meeting_end{}
-#                   button{action: bookmark | forget_last, minutes?}
 #   hub -> client : welcome{resume_token, seq, missed[], led_state} | pong
 #                   event{topic: led_state|transcript|recall|answer, seq, data}
+#
+# (Push-button bookmark/forget and the hardware mute switch are intentionally
+#  not implemented.)
 #
 # Flow: ALSA capture -> 5 s pre-roll ring buffer -> local VAD + "Hey Recall"
 # wake word. On wake we open a meeting (LED -> capturing on the hub), stream the
 # pre-roll + live audio as raw PCM16 binary frames, and close the meeting after a
 # silence hangover so the hub ingests it as one memory. LED state is driven by
-# the hub's led_state events, forwarded to the MCU over the RPC bridge. The
-# hardware mute switch gates audio locally (physical privacy).
+# the hub's led_state events, forwarded to the MCU over the RPC bridge.
 #
 # The original wake-word -> LED heart flourish (Bridge.call("keyword_detected"))
 # is preserved. Everything degrades gracefully if websocket-client or the hub is
@@ -235,12 +236,6 @@ class HubClient:
         self.in_meeting = False
         self._send_json({"type": "meeting_end"}, buffer_if_down=False)
 
-    def button(self, action, minutes=None):
-        msg = {"type": "button", "action": action}
-        if minutes is not None:
-            msg["minutes"] = minutes
-        self._send_json(msg)   # buffered if offline — user intent is worth keeping
-
 
 # ---------------------------------------------------------------------------
 # Capture pipeline: ring buffer -> VAD -> wake -> stream meeting
@@ -252,15 +247,7 @@ class Pipeline:
         self.last_trigger = 0.0
         self.forward_until = 0.0
         self.meeting_deadline = 0.0
-        self.muted = False
         self._led = LED_INDEX["idle"]
-
-    def set_muted(self, muted):
-        """Hardware mute switch: gate all audio locally (physical privacy)."""
-        self.muted = bool(muted)
-        if self.muted and self.hub.in_meeting:
-            self.hub.meeting_end()
-        self.set_led(LED_INDEX["muted"] if self.muted else LED_INDEX["idle"])
 
     def set_led(self, index):
         if index == self._led:
@@ -293,9 +280,6 @@ class Pipeline:
     def process_window(self, window, samples):
         now = time.time()
         self.pre_roll.append(window)
-
-        if self.muted:
-            return   # physical privacy: nothing leaves the device
 
         is_speech = self._rms(samples) >= VAD_RMS_THRESHOLD
 
@@ -367,32 +351,10 @@ def capture_supervisor(pipeline):
 
 
 # ---------------------------------------------------------------------------
-# MCU button / mute events (provided to the sketch via the RPC bridge)
-# ---------------------------------------------------------------------------
-def on_button(action):
-    """tap -> 'bookmark', hold 3 s -> 'forget'. Mapped to hub button actions."""
-    action = str(action)
-    print(f"[button] {action}", flush=True)
-    if action == "forget":
-        hub.button("forget_last", minutes=5)
-    else:
-        hub.button("bookmark")
-
-
-def on_mute_changed(muted):
-    print(f"[mute] {'muted' if muted else 'unmuted'}", flush=True)
-    pipeline.set_muted(muted)
-
-
-# ---------------------------------------------------------------------------
 # Wiring
 # ---------------------------------------------------------------------------
 hub = HubClient(HUB_WS_URL, on_led=lambda i: pipeline.set_led(i))
 pipeline = Pipeline(hub)
-
-# The sketch calls these over the bridge (buttons + hardware mute switch).
-Bridge.provide("button_event", on_button)
-Bridge.provide("mute_changed", on_mute_changed)
 
 # Supervised ALSA capture in the background so App.run() owns the main thread.
 threading.Thread(target=capture_supervisor, args=(pipeline,), daemon=True).start()
