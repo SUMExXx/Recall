@@ -83,7 +83,7 @@ Recall PC Hub
     # only shared-state bugs. If you need to scale request handling, that has
     # to go through a shared store (Postgres) + a shared pub/sub for the WS
     # fabric first; don't set workers>1 on this app before that exists.
-    uvicorn.run("hub.app:app", host="127.0.0.1", port=args.port,
+    uvicorn.run("hub.app:app", host="0.0.0.0", port=args.port, 
                 log_level=cfg.log_level.lower())
 
 

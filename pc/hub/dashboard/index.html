@@ -500,6 +500,16 @@ function addRelatedCard(d) {
 const CITATION_RE = /\s*\[[0-9a-f]{6,10}:\d+\]/gi;
 function stripCitations(text) { return (text || '').replace(CITATION_RE, ''); }
 
+// While streaming, a citation like "[8f52a72:1]" arrives one character at a
+// time — stripCitations can't match it until the closing "]" lands, so the
+// raw id would otherwise flash on screen mid-type. Hold back everything from
+// the last unclosed "[" onward until it closes.
+function stripPartialCitation(text) {
+  const lastOpen = text.lastIndexOf('[');
+  const lastClose = text.lastIndexOf(']');
+  return lastOpen > lastClose ? text.slice(0, lastOpen) : text;
+}
+
 function renderAnswer(out) {
   const speakBtn = out.answer
     ? ` <button class="speak-btn" id="speak-answer" title="speak via Sarvam TTS">🔊</button>`
@@ -540,6 +550,93 @@ async function speak(text) {
   } catch (e) {
     console.error('tts failed:', e);   // cloud opt-in likely off — see /policy
   }
+}
+
+// Sequential playback queue for streamed TTS chunks (/ask/stream "audio"
+// events) — MP3 frames are self-contained (no shared container header like
+// fMP4/WebM need), so each chunk plays fine as its own <audio> source;
+// queuing them back-to-back avoids needing MediaSource Extensions.
+const streamAudioQueue = [];
+let streamAudioPlaying = false;
+
+function queueStreamAudio(b64) {
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  const audio = new Audio(URL.createObjectURL(new Blob([bytes], {type: 'audio/mpeg'})));
+  streamAudioQueue.push(audio);
+  playNextStreamAudio();
+}
+
+function playNextStreamAudio() {
+  if (streamAudioPlaying || !streamAudioQueue.length) return;
+  streamAudioPlaying = true;
+  const audio = streamAudioQueue.shift();
+  const advance = () => { URL.revokeObjectURL(audio.src); streamAudioPlaying = false; playNextStreamAudio(); };
+  audio.onended = advance;
+  audio.play().catch(advance);
+}
+
+function finalizeAnswer(out) {
+  const cleanText = stripCitations(out.answer);
+  const speakBtn = out.answer
+    ? ` <button class="speak-btn" id="speak-answer" title="replay via Sarvam TTS">🔊</button>`
+    : '';
+  let html = `<div>${esc(cleanText) || esc(out.error) || ''}${speakBtn}</div>` +
+    `<div class="latency">${out.latency_ms} ms` +
+    (out.plan ? ` · ${esc(out.plan.query_type)}` : '') + `</div>`;
+  if (out.sources && out.sources.length) {
+    html += '<ul class="sources">' + out.sources.map(s =>
+      `<li>${esc(s.source_type)}: "${esc(s.chunk_title || s.title)}" ` +
+      `<span style="opacity:.7">(${Number(s.score).toFixed(2)})</span>` +
+      `<div style="color:var(--muted); font-size:11.5px; margin:2px 0 6px">` +
+      `${esc(s.snippet)}</div></li>`).join('') + '</ul>';
+    flashNodes(out.sources.map(s => s.memory_id), {r: 87, g: 200, b: 123});
+  }
+  answerEl.innerHTML = html;
+  if (out.answer) {
+    // no auto speak() here — audio already played live as it streamed in;
+    // the button just lets you replay the finished answer on demand.
+    document.getElementById('speak-answer').onclick = () => speak(cleanText);
+  }
+}
+
+async function askStream(query) {
+  answerEl.textContent = '…';
+  let text = '', doneEvent = null, buf = '';
+  try {
+    const r = await fetch('/ask/stream', {method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({query})});
+    const reader = r.body.getReader();
+    const decoder = new TextDecoder();
+    while (true) {
+      const {value, done} = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, {stream: true});
+      let idx;
+      while ((idx = buf.indexOf('\n\n')) >= 0) {
+        const frame = buf.slice(0, idx);
+        buf = buf.slice(idx + 2);
+        if (!frame.startsWith('data: ')) continue;
+        const evt = JSON.parse(frame.slice(6));
+        if (evt.type === 'delta') {
+          text += evt.text;
+          answerEl.innerHTML = `<div>${esc(stripCitations(stripPartialCitation(text)))}</div>`;
+        } else if (evt.type === 'audio') {
+          queueStreamAudio(evt.audio_b64);
+        } else if (evt.type === 'done') {
+          doneEvent = evt;
+        } else if (evt.type === 'error') {
+          answerEl.innerHTML = `<div>${esc(evt.error)}</div>`;
+        }
+      }
+    }
+  } catch (e) {
+    answerEl.innerHTML = `<div>ask failed: ${esc(String(e))}</div>`;
+    return;
+  }
+  if (doneEvent) finalizeAnswer(doneEvent);
 }
 
 function renderDevices(devs) {
@@ -596,15 +693,11 @@ function handleEvent(m) {
 connect();
 
 // ---------------------------------------------------------------- ask ----
-queryInput.addEventListener('keydown', async (e) => {
+queryInput.addEventListener('keydown', (e) => {
   if (e.key !== 'Enter' || !queryInput.value.trim()) return;
   const query = queryInput.value.trim();
   queryInput.value = '';
-  answerEl.textContent = '…';
-  const r = await fetch('/ask', {method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({query})});
-  renderAnswer(await r.json());
+  askStream(query);
 });
 
 // -------------------------------------------------------------- digest ---

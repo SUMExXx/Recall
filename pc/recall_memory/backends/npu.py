@@ -16,6 +16,7 @@ the runtime present. On the laptop, use `RECALL_BACKEND=ollama` instead.
 """
 from __future__ import annotations
 
+import json
 from functools import cached_property
 
 import numpy as np
@@ -155,6 +156,29 @@ class QwenGenieLLM:
                 r.raise_for_status()
                 return r.json()["choices"][0]["message"]["content"].strip()
             raise e
+
+    def generate_stream(self, prompt: str, *, timeout: float = 180.0):
+        """Same OpenAI-compatible endpoint, SSE streaming mode: lines of
+        `data: {...}` with incremental `choices[0].delta.content`, terminated
+        by a literal `data: [DONE]`."""
+        import requests
+        body = {"model": self.model, "stream": True,
+                "messages": [{"role": "user", "content": prompt}]}
+        r = requests.post(f"{self.endpoint}/v1/chat/completions",
+                          json=body, timeout=timeout, stream=True)
+        r.raise_for_status()
+        for line in r.iter_lines():
+            if not line:
+                continue
+            text = line.decode() if isinstance(line, bytes) else line
+            if not text.startswith("data: "):
+                continue
+            payload = text[len("data: "):].strip()
+            if payload == "[DONE]":
+                break
+            delta = json.loads(payload)["choices"][0].get("delta", {}).get("content", "")
+            if delta:
+                yield delta
 
 
 class QwenQnnReranker:

@@ -25,6 +25,7 @@ dependencies = [
     "mcp>=1.2",
     "tokenizers>=0.20",
     "python-dotenv>=1.0",
+    "websockets>=12",   # Sarvam streaming TTS (wss://.../text-to-speech/ws)
 ]
 
 [project.optional-dependencies]

@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import re
 import time
 from dataclasses import dataclass, field
 
@@ -24,6 +25,38 @@ from .store import MemoryStore
 from .tracing import ensure_trace, step
 
 log = logging.getLogger("recall.retrieval")
+
+_CITATION_RE = re.compile(r"\s*\[[0-9a-f]{6,10}:\d+\]", re.IGNORECASE)
+
+
+class _SpokenTextFilter:
+    """Strips inline citations like "[8f52a72:1]" out of an LLM's streamed
+    deltas before they reach TTS — read aloud verbatim they come out as
+    garbled digits ("eight eff five two a seven two colon one"), which is
+    exactly the "numbers and noise" a listener notices. A citation arrives
+    one character at a time, so a per-delta regex can't tell yet whether a
+    "[" starts one until it closes; this buffers from the last unclosed "["
+    onward until it resolves, mirroring the dashboard's own
+    stripPartialCitation() for the visible transcript."""
+
+    def __init__(self):
+        self._buf = ""
+
+    def feed(self, delta: str) -> str:
+        self._buf += delta
+        last_open, last_close = self._buf.rfind("["), self._buf.rfind("]")
+        if last_open > last_close:
+            emit = _CITATION_RE.sub("", self._buf[:last_open])
+            self._buf = self._buf[last_open:]
+            return emit
+        emit = _CITATION_RE.sub("", self._buf)
+        self._buf = ""
+        return emit
+
+    def flush(self) -> str:
+        emit = _CITATION_RE.sub("", self._buf)
+        self._buf = ""
+        return emit
 
 
 @dataclass
@@ -128,12 +161,13 @@ class Retriever:
             boosted = self._boost(fused, profile["boost"])
             s.detail(boost_weights=profile["boost"])
         top = sorted(boosted.items(), key=lambda kv: -kv[1])[:COARSE_TOPK]
-        with step("rescore_float768_cosine") as s:
+        with step(f"rescore_float{DIM_FULL}_cosine") as s:
             scored = self._rescore(top, query_vec)
             s.detail(candidates=len(scored))
         cos_of = {cid: cos for cid, _s, cos in scored}
         rescored = [(cid, s) for cid, s, _cos in scored]
 
+        rerank_scores: dict[int, float] = {}
         if plan.rerank:
             with step("rerank", reranker=self.reranker.name) as s:
                 cands_chunk_ids = [cid for cid, _ in rescored[:RERANK_TOPK]]
@@ -143,26 +177,42 @@ class Retriever:
                     crow = cands_chunks.get(cid)
                     if crow:
                         cands.append((cid, sc, crow["text"]))
-                rescored = self.reranker.rerank(query, cands) + rescored[RERANK_TOPK:]
+                reranked = self.reranker.rerank(query, cands)
+                rerank_scores = dict(reranked)
+                rescored = reranked + rescored[RERANK_TOPK:]
                 s.detail(candidates=len(cands))
 
-        # Relevance cutoff: a candidate whose ONLY support is the vector route
-        # needs a cosine competitive with the best hit — RRF rank share alone
-        # lets unrelated chunks ride in at ~0.5 when the pool is small.
+        # Relevance cutoff. Two independent signals, either can drop a
+        # candidate:
+        #  - cross-encoder: a REAL reranker (not passthrough) already judged
+        #    this (query, chunk) pair — a candidate it scored near-zero must
+        #    not reach the LLM just because it also picked up an incidental
+        #    BM25/entity hit (e.g. one shared stopword). Without this, the
+        #    reranker's score was computed but never actually gated anything.
+        #  - vector-only: a candidate whose ONLY support is the vector route
+        #    needs a cosine competitive with the best hit — RRF rank share
+        #    alone lets unrelated chunks ride in at ~0.5 when the pool is small.
         with step("relevance_cutoff") as s:
+            is_real_reranker = bool(rerank_scores) and self.reranker.name != "passthrough"
+            top_rerank = max(rerank_scores.values(), default=0.0)
             evidence = {cid for route, results in route_lists.items()
                         if route != "vector" for cid, _ in results}
             top_cos = max(cos_of.values(), default=0.0)
             before = len(rescored)
-            if top_cos > 0:
-                kept = []
-                for cid, sc in rescored:
+            kept = []
+            for cid, sc in rescored:
+                if is_real_reranker and cid in rerank_scores:
+                    rs = rerank_scores[cid]
+                    if rs < 0.1 or rs < 0.25 * top_rerank:
+                        continue
+                elif top_cos > 0:
                     is_vec_only = cid not in evidence
                     cos = cos_of.get(cid, 0.0)
-                    if not is_vec_only or (cos >= 0.40 and cos >= 0.6 * top_cos):
-                        kept.append((cid, sc))
-                if kept:
-                    rescored = kept
+                    if is_vec_only and not (cos >= 0.40 and cos >= 0.6 * top_cos):
+                        continue
+                kept.append((cid, sc))
+            if kept:
+                rescored = kept
             s.detail(before=before, after=len(rescored), dropped=before - len(rescored))
 
         with step("small_to_big_expand", top_k=top_k) as s:
@@ -254,10 +304,10 @@ class Retriever:
         contexts = self._retrieve_impl(query, plan, top_k, query_vec=query_vec)
         t_retrieve = time.perf_counter()
         if not contexts:
-            log.info("ask %r: NOTFOUND (embed %.0f ms, retrieve %.0f ms)",
+            log.info("ask %r: no matches (embed %.0f ms, retrieve %.0f ms)",
                      query[:50], (t_embed - t0) * 1000,
                      (t_retrieve - t_embed) * 1000)
-            return {"answer": "NOTFOUND — no matching memories.",
+            return {"answer": self._no_context_answer(query),
                     "plan": plan, "contexts": [], "okf": None}
         with step("okf_lookup") as s:
             okf = self._okf_for_contexts(contexts)
@@ -270,6 +320,157 @@ class Retriever:
                  (time.perf_counter() - t_retrieve) * 1000,
                  len(contexts), " · okf" if okf else "")
         return {"answer": answer, "plan": plan, "contexts": contexts, "okf": okf}
+
+    _NO_CONTEXT_PROMPT = (
+        "You are Recall, a personal on-device memory assistant. The user "
+        "asked a question below, but no relevant memory was found for it. "
+        "Reply with one short, natural sentence saying you don't have "
+        "anything recorded about this yet. Do not guess, do not invent "
+        "facts, do not apologize at length.\n\nQUESTION: {query}\nANSWER:")
+
+    def _no_context_answer(self, query: str) -> str:
+        """Still speaks through the LLM when possible — a bare "NOTFOUND"
+        string reads as a broken assistant, not an honest "I don't know
+        that yet" from one. Never fabricates facts either way: with no
+        contexts there is nothing for the LLM to draw on but the question
+        itself, and the prompt explicitly forbids guessing."""
+        fallback = "I don't have anything recorded about that yet."
+        if not self.llm.available:
+            return fallback
+        try:
+            return self.llm.generate(
+                self._NO_CONTEXT_PROMPT.format(query=query), timeout=15.0).strip() or fallback
+        except Exception:
+            return fallback
+
+    def ask_stream(self, query: str, top_k: int = ANSWER_TOPK, tts=None):
+        """Like ask(), but yields incremental events instead of one blob —
+        for a UI that wants to show the answer typing out and (optionally)
+        hear it spoken before the whole thing has finished generating:
+
+          {"type": "delta", "text": "..."}   — next chunk of the LLM answer
+          {"type": "audio", "audio": bytes}  — TTS audio chunk, if `tts` given
+          {"type": "done", "answer":, "plan":, "contexts":, "okf":}
+
+        `tts`, when given, must expose stream_synthesize(text_chunks_iter)
+        -> Iterator[bytes] (see hub/tts.py). The SAME deltas driving the
+        visible transcript are fed to it live, on a background thread, so
+        the first sentence can be playing while later ones are still being
+        generated — one LLM pass drives both the transcript and the voice.
+        Falls back to a single delta + done when the backend has no
+        streaming LLM (generate_stream raises/unavailable) or no contexts
+        were found.
+        """
+        with ensure_trace("ask", query=query, top_k=top_k, streaming=True):
+            yield from self._ask_stream_impl(query, top_k, tts)
+
+    def _ask_stream_impl(self, query: str, top_k: int, tts):
+        with step("embed_query", text=query) as s:
+            query_vec = self.embedder.embed_query(query)
+            s.detail(embedder=self.embedder.name)
+        plan = self.router.route(query)
+        contexts = self._retrieve_impl(query, plan, top_k, query_vec=query_vec)
+        if not contexts:
+            answer = self._no_context_answer(query)
+            yield {"type": "delta", "text": answer}
+            yield {"type": "done", "answer": answer, "plan": plan,
+                  "contexts": [], "okf": None}
+            return
+        with step("okf_lookup") as s:
+            okf = self._okf_for_contexts(contexts)
+            s.detail(attached=okf is not None)
+
+        if not self.llm.available:
+            answer = self._synthesize(query, contexts, okf)
+            yield {"type": "delta", "text": answer}
+            yield {"type": "done", "answer": answer, "plan": plan,
+                  "contexts": contexts, "okf": okf}
+            return
+
+        prompt = self._build_prompt(query, contexts, okf)
+        parts: list[str] = []
+        import queue as _queue
+        audio_q: _queue.Queue = _queue.Queue()
+        _done = object()
+        tts_thread = None
+
+        if tts is not None:
+            import threading
+
+            text_q: _queue.Queue = _queue.Queue()
+            spoken = _SpokenTextFilter()
+
+            def _text_source():
+                while True:
+                    item = text_q.get()
+                    if item is _done:
+                        return
+                    yield item
+
+            def _pump():
+                try:
+                    for chunk in tts.stream_synthesize(_text_source()):
+                        audio_q.put(chunk)
+                except Exception:
+                    log.warning("ask_stream: tts pump failed", exc_info=True)
+                finally:
+                    audio_q.put(_done)
+
+            tts_thread = threading.Thread(target=_pump, daemon=True)
+            tts_thread.start()
+
+        # `_done` off audio_q is consumed exactly once by whichever loop
+        # below sees it first — this flag stops the OTHER loop from then
+        # blocking on a sentinel that's already gone (a real bug caught
+        # while writing this: the final drain used to `get(timeout=30)`
+        # forever if the mid-stream opportunistic drain had already
+        # swallowed the one-and-only `_done`).
+        tts_finished = tts is None
+
+        with step("llm_synthesize_stream", backend=self.backend.name,
+                  model=getattr(self.llm, "model", self.llm.name),
+                  prompt_chars=len(prompt)) as s:
+            try:
+                for delta in self.llm.generate_stream(prompt):
+                    parts.append(delta)
+                    if tts is not None:
+                        spoken_text = spoken.feed(delta)
+                        if spoken_text:
+                            text_q.put(spoken_text)
+                    yield {"type": "delta", "text": delta}
+                    if tts is not None and not tts_finished:
+                        while True:
+                            try:
+                                item = audio_q.get_nowait()
+                            except _queue.Empty:
+                                break
+                            if item is _done:
+                                tts_finished = True
+                                break
+                            yield {"type": "audio", "audio": item}
+            except Exception as e:
+                s.detail(fallback=f"LLM stream unavailable: {e}")
+                if not parts:   # nothing streamed yet — fall back cleanly
+                    answer = self._synthesize(query, contexts, okf)
+                    parts = [answer]
+                    yield {"type": "delta", "text": answer}
+            s.detail(response="".join(parts))
+
+        if tts is not None:
+            trailing = spoken.flush()
+            if trailing:
+                text_q.put(trailing)
+            text_q.put(_done)
+            if not tts_finished:
+                while True:
+                    item = audio_q.get(timeout=30.0)
+                    if item is _done:
+                        break
+                    yield {"type": "audio", "audio": item}
+            tts_thread.join(timeout=1.0)
+
+        yield {"type": "done", "answer": "".join(parts), "plan": plan,
+              "contexts": contexts, "okf": okf}
 
     def _okf_for_contexts(self, contexts: list[RetrievedContext]) -> dict | None:
         """Skim-the-README (plan §7): if one source root dominates the hits and
@@ -294,8 +495,8 @@ class Retriever:
         row = self.store.get_okf(stype, skey)
         return json.loads(row["manifest"]) if row else None
 
-    def _synthesize(self, query: str, contexts: list[RetrievedContext],
-                    okf: dict | None = None) -> str:
+    def _build_prompt(self, query: str, contexts: list[RetrievedContext],
+                      okf: dict | None = None) -> str:
         blocks = []
         for c in contexts:
             # chunk_title (this hit's OWN extractive label) over the parent
@@ -313,12 +514,20 @@ class Retriever:
         if okf:
             okf_block = ("SOURCE OVERVIEW (skim this table of contents first):\n"
                          + json.dumps(okf, ensure_ascii=False)[:1200] + "\n\n")
-        prompt = (
-            "You are Recall, an on-device memory assistant. Answer the question "
-            "using ONLY the memory excerpts below. Cite the source of each fact you use in your answer "
-            "of the excerpts you used. If the excerpts do not contain the "
-            "answer, reply exactly NOTFOUND.\n\n"
+        return (
+            "You are Recall, a personal on-device memory assistant. Answer the "
+            "QUESTION using ONLY facts stated in the MEMORY EXCERPTS below — no "
+            "outside knowledge, no guessing. Write one short, direct, "
+            "natural-sounding answer in your own words — do not just copy an "
+            "excerpt verbatim, and ignore any filler or rambling in an excerpt "
+            "that isn't actually about the question. Cite the excerpt each "
+            "fact came from inline, like [abc12345:3]. If the excerpts don't "
+            "actually answer the question, reply exactly NOTFOUND.\n\n"
             f"{okf_block}MEMORY EXCERPTS:\n{context_str}\n\nQUESTION: {query}\nANSWER:")
+
+    def _synthesize(self, query: str, contexts: list[RetrievedContext],
+                    okf: dict | None = None) -> str:
+        prompt = self._build_prompt(query, contexts, okf)
         with step("llm_synthesize", backend=self.backend.name,
                   model=getattr(self.llm, "model", self.llm.name),
                   prompt_chars=len(prompt)) as s:

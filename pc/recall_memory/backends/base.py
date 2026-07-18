@@ -47,6 +47,11 @@ class LLM(Protocol):
         "the model echoed the placeholder back" into a class of error that
         can no longer happen, rather than one you detect-and-retry."""
         ...
+    def generate_stream(self, prompt: str, *, timeout: float = 180.0):
+        """Same contract as generate() but yields text deltas as they're
+        produced instead of returning the full completion at once — no
+        schema/json mode (those need the whole object to parse)."""
+        ...
 
 
 @runtime_checkable
@@ -65,6 +70,10 @@ class NullLLM:
     def generate(self, prompt: str, *, json: bool = False,
                  schema: dict | None = None, timeout: float = 180.0) -> str:
         raise RuntimeError("no LLM configured on this backend")
+
+    def generate_stream(self, prompt: str, *, timeout: float = 180.0):
+        raise RuntimeError("no LLM configured on this backend")
+        yield   # pragma: no cover — makes this a generator function
 
 
 class PassthroughReranker:
