@@ -1,4 +1,8 @@
-numpy
-requests
-sqlite-vec>=0.1.7
-pytest
+# Dependencies are declared in pyproject.toml.
+#
+#   pip install -e .          # dev laptop           (RECALL_BACKEND=ollama)
+#   pip install -e ".[npu]"   # Snapdragon X Elite    (RECALL_BACKEND=npu, default)
+#   pip install -e ".[dev]"   # + test tooling
+#
+# `make setup` runs the first line.
+-e .

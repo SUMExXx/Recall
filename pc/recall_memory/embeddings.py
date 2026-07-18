@@ -1,12 +1,15 @@
-"""Embedding providers + two-tier Matryoshka vectors (plan §2, §9).
+"""Vector math + the offline HashEmbedder (plan §2, §9).
 
-Full tier: float32[768] (rescore, stored as BLOB on chunks).
-Coarse tier: Matryoshka truncate 768->256, renormalize, scalar-quantize to int8
-(hot brute-force scan in vec_chunks).
+The two-tier Matryoshka scheme lives here because it is backend-independent:
+full tier float32[768] (rescore, stored as BLOB on chunks); coarse tier
+Matryoshka-truncate 768->256, renormalize, scalar-quantize to int8 (the hot
+brute-force scan in vec_chunks).
 
-OllamaEmbedder is the dev substitute for the AI Hub Nomic v1.5 NPU asset — same
-model family and dimension, including the search_document:/search_query: task
-prefixes. HashEmbedder is a deterministic offline fallback (tests, no Ollama).
+Concrete embedders live in `recall_memory/backends/`:
+  ollama.OllamaEmbedder   dev substitute (nomic-embed-text, 768-dim)
+  npu.NomicQnnEmbedder    Nomic-Embed-Text v1.5 on the NPU via ORT-QNN
+HashEmbedder (here) is the deterministic offline stub used by the `hash`
+backend — lexical, not semantic, but stable across runs for tests/CI.
 """
 from __future__ import annotations
 
@@ -61,42 +64,7 @@ class HashEmbedder:
         return self._embed([text])[0]
 
 
-class OllamaEmbedder:
-    name = "ollama"
-
-    def __init__(self, cfg: RecallConfig):
-        self.url = cfg.ollama_url.rstrip("/")
-        self.model = cfg.embed_model
-
-    def _embed(self, texts: list[str]) -> np.ndarray:
-        import requests
-        resp = requests.post(
-            f"{self.url}/api/embed",
-            json={"model": self.model, "input": texts},
-            timeout=120,
-        )
-        resp.raise_for_status()
-        mat = np.array(resp.json()["embeddings"], dtype=np.float32)
-        if mat.shape[-1] != DIM_FULL:
-            raise ValueError(f"expected {DIM_FULL}-dim embeddings, got {mat.shape[-1]}")
-        return _normalize(mat)
-
-    def embed_documents(self, texts: list[str]) -> np.ndarray:
-        return self._embed([DOC_PREFIX + t for t in texts])
-
-    def embed_query(self, text: str) -> np.ndarray:
-        return self._embed([QUERY_PREFIX + text])[0]
-
-
 def get_embedder(cfg: RecallConfig):
-    if cfg.embedder == "hash":
-        return HashEmbedder()
-    if cfg.embedder == "ollama":
-        return OllamaEmbedder(cfg)
-    # auto: probe Ollama, fall back to hash
-    try:
-        import requests
-        requests.get(f"{cfg.ollama_url.rstrip('/')}/api/tags", timeout=2).raise_for_status()
-        return OllamaEmbedder(cfg)
-    except Exception:
-        return HashEmbedder()
+    """Backward-compatible shim — resolves the embedder from the active backend."""
+    from .backends import get_backend
+    return get_backend(cfg).embedder

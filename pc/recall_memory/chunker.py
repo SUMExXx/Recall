@@ -10,12 +10,47 @@ niceties are the cheap boundary preferences from the plan table:
 """
 from __future__ import annotations
 
+import re
+from typing import Callable
+
 from .config import CHUNK_SPECS, ChunkSpec
 from .nmo import NMO, Chunk, Episode
-from .tokenizer import Token, tokenize
+from .tokenizer import Token
+from .tokenizer import tokenize as _regex_tokenize
+
+# A tokenizer is any callable text -> [Token] with char spans. Defaults to the
+# regex tokenizer; the ingestor passes the active backend's model tokenizer so
+# fixed windows line up with the Nomic seqlen graphs on the NPU (plan §5).
+Tokenize = Callable[[str], list[Token]]
 
 # How far back (fraction of window) we will move a cut to honor a cheap boundary.
 _BOUNDARY_SLACK = 0.10
+
+_TITLE_MAX_CHARS = 70
+_SENTENCE_END_RE = re.compile(r"[.!?](?:\s|$)")
+_SPEAKER_PREFIX_RE = re.compile(r"^([A-Za-z][\w\s]{0,30}?):\s+")
+
+
+def clip_title(t: str) -> str:
+    if len(t) > _TITLE_MAX_CHARS:
+        t = t[:_TITLE_MAX_CHARS - 1].rsplit(" ", 1)[0] + "…"
+    return t
+
+
+def _extractive_title(text: str) -> str:
+    """A short, deterministic label from the CHUNK's own text — every chunk
+    of a memory previously showed the same generic parent-memory title in
+    citations/dashboard, making it impossible to tell which part of a long
+    meeting a given hit actually came from. First clause, sentence-bounded
+    where cheap, speaker-label stripped for meetings, no LLM call. Used
+    immediately at ingest time; may be upgraded later by an async LLM title
+    (see ingest.py) once the backend has one available."""
+    t = _SPEAKER_PREFIX_RE.sub("", text.strip(), count=1)
+    m = _SENTENCE_END_RE.search(t)
+    if m and m.start() >= 8:
+        t = t[:m.start() + 1]
+    t = " ".join(t.split())
+    return clip_title(t)
 
 
 def _window_starts(n_tokens: int, spec: ChunkSpec) -> list[int]:
@@ -30,9 +65,11 @@ def _make_chunk(nmo: NMO, index: int, tokens: list[Token], text: str,
                 lo: int, hi: int) -> Chunk:
     """Build a chunk over tokens[lo:hi] (hi exclusive) with exact char spans."""
     char_start, char_end = tokens[lo].start, tokens[hi - 1].end
+    chunk_text = text[char_start:char_end]
     return Chunk(
         memory_id=nmo.memory_id, chunk_index=index, token_count=hi - lo,
-        text=text[char_start:char_end], char_start=char_start, char_end=char_end,
+        text=chunk_text, char_start=char_start, char_end=char_end,
+        title=_extractive_title(chunk_text),
     ).inherit(nmo)
 
 
@@ -47,7 +84,7 @@ def _prefer_boundary(text: str, tokens: list[Token], lo: int, hi: int,
     return hi
 
 
-def chunk_document(nmo: NMO) -> list[Chunk]:
+def chunk_document(nmo: NMO, tokenize: Tokenize = _regex_tokenize) -> list[Chunk]:
     """Fixed windows for github_repo / pdf / text / note; whole-block for image."""
     text = nmo.content
     if nmo.source_type == "image":
@@ -86,7 +123,8 @@ def build_transcript(episodes: list[Episode]) -> tuple[str, list[tuple[int, int,
     return "\n".join(parts), spans
 
 
-def chunk_meeting(nmo: NMO, episodes: list[Episode]) -> list[Chunk]:
+def chunk_meeting(nmo: NMO, episodes: list[Episode],
+                  tokenize: Tokenize = _regex_tokenize) -> list[Chunk]:
     """Fixed windows over the episode-ordered transcript.
 
     Speaker-attribution rule: a window never *starts* between a line's

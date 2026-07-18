@@ -1,5 +1,10 @@
 # Recall — Architecture Diagrams
 
+> Memory-layer detail (NMO schema, fixed-size chunking, 4-tier router,
+> two-tier Matryoshka vectors, consolidation) lives in
+> `plans/memory_engineering_v2.md` — that doc is the source of truth for
+> everything inside the Memory Core boxes below.
+
 ## 1. System Topology
 
 ```mermaid
@@ -17,8 +22,8 @@ flowchart LR
 
     subgraph PCC["Snapdragon X Elite PC — Hub"]
         C1["WS Hub + Device Registry<br/>mDNS, heartbeats, leases, resume tokens"]
-        C2["NPU Workers<br/>Whisper / bge / Qwen (Genie)"]
-        C3["Memory Core<br/>vector DB + graph, proactive recall,<br/>consolidation agent, policy engine"]
+        C2["NPU Workers<br/>Whisper-Base/Small-En · Nomic v1.5<br/>Qwen3-4B (GenieX) · Qwen3-Reranker"]
+        C3["Memory Core (NMO)<br/>episodes + fixed chunks, vec int8[256],<br/>proactive recall, consolidation, policy engine"]
         C4["MCP Server"]
         C5["Dashboard<br/>canvas, transcript, health, bench"]
     end
@@ -167,22 +172,22 @@ flowchart TB
     end
 
     subgraph NPU["Inference Workers — Hexagon NPU"]
-        ASR["ASR: Whisper-small INT8<br/>ONNX Runtime + QNN EP"]
-        EMB["Embedder: bge-small INT8"]
-        LLM["LLM: Qwen2.5-3B<br/>Genie SDK"]
+        ASR["ASR: Whisper-Base-En w8a16 (live)<br/>+ Small-En (dream re-transcribe), ORT-QNN"]
+        EMB["Embedder: Nomic-Embed-Text v1.5<br/>768-dim float → Matryoshka int8[256]"]
+        LLM["LLM: Qwen3-4B-Instruct w4a16, GenieX<br/>+ Qwen3-Reranker-0.6B"]
     end
 
     subgraph CORE["Memory Core"]
-        ING["Ingest + Segmenter<br/>jitter buffer, WAL journal"]
-        RET["Retrieval Service<br/>ANN search + rerank"]
+        ING["Ingest + NMO Normalizer<br/>fixed 256-tok chunker, WAL journal"]
+        RET["Retrieval Service<br/>4-tier router, brute-force vec,<br/>weighted RRF + rescore + rerank"]
         PRO["Proactive Recall Engine<br/>rolling 45s window, threshold, cooldown"]
         CON["Consolidation Agent<br/>dedupe, merge groups, compact, correct"]
         POL["Policy Engine<br/>privacy tags, cloud eligibility"]
     end
 
     subgraph ST["Local Storage"]
-        VDB[("Vector DB<br/>sqlite-vec")]
-        GDB[("Graph Store<br/>memory dots + correlation edges")]
+        VDB[("SQLite memory store<br/>NMO memories · episodes · chunks<br/>FTS5 + vec_chunks int8[256]")]
+        GDB[("Graph + entity index<br/>bi-temporal relations, entity_mentions")]
         BLB[("Blob Store<br/>images, audio clips")]
         OBX[("Outbox / WAL")]
     end

@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Recall - Capture (fallback)</title>
+<style>
+  body{background:#12100c; color:#ece7db; font-family:-apple-system,sans-serif;
+       margin:0; padding:24px; text-align:center}
+  button{font-size:18px; padding:16px 32px; border-radius:999px; border:none;
+         background:#f0a030; color:#12100c; font-weight:700}
+  button.stop{background:#e8837c}
+  #dot{display:inline-block; width:10px; height:10px; border-radius:50%;
+       background:#a39b8a; margin-right:8px}
+  #dot.live{background:#57c87b}
+  #status{margin-top:16px; font-size:13px; color:#a39b8a}
+  #debug{margin-top:16px; font-size:12px; color:#a39b8a; font-family:monospace;
+         line-height:1.8}
+  #error{margin-top:12px; font-size:12px; color:#e8837c; white-space:pre-wrap}
+  a{color:#f0a030}
+</style>
+</head>
+<body>
+<h2>Recall - capture</h2>
+<p>Web mic capture streaming PCM16 to the hub's <code>/ws</code>. The hub
+buffers ~4 s windows and transcribes them in-process (faster-whisper), or via
+the server at <code>RECALL_WHISPER_URL</code> in http mode. Requires a secure
+context - use <code>http://localhost:8000/capture</code>.</p>
+<button id="toggle">Start capture</button>
+<p id="status"><span id="dot"></span>disconnected</p>
+<div id="debug">chunks: 0 · bytes sent: 0 · last chunk: 0 B<br>
+audioContext state: - · ws state: -</div>
+<div id="error"></div>
+
+<script>
+let ws, audioCtx, source, processor, stream;
+let chunks = 0, bytesSent = 0, lastChunk = 0, live = false;
+const btn = document.getElementById('toggle');
+const dot = document.getElementById('dot');
+const status = document.getElementById('status');
+const debugEl = document.getElementById('debug');
+const errorEl = document.getElementById('error');
+
+function renderDebug() {
+  const wsState = ws ? ['connecting','open','closing','closed'][ws.readyState] : '-';
+  const ctxState = audioCtx ? audioCtx.state : '-';
+  const ctxRate = audioCtx ? `${audioCtx.sampleRate} Hz` : '-';
+  debugEl.innerHTML = `chunks: ${chunks} &middot; bytes sent: ${bytesSent} ` +
+    `&middot; last chunk: ${lastChunk} B<br>audioContext state: ${ctxState} ` +
+    `&middot; mic rate: ${ctxRate} (resampled &rarr; 16 kHz) ` +
+    `&middot; ws state: ${wsState}`;
+}
+setInterval(renderDebug, 500);
+
+function floatTo16BitPCM(input) {
+  const output = new Int16Array(input.length);
+  for (let i = 0; i < input.length; i++) {
+    const s = Math.max(-1, Math.min(1, input[i]));
+    output[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+  }
+  return output;
+}
+
+// The hub expects 16 kHz PCM16. Browsers may ignore the requested
+// AudioContext sample rate (hardware often runs 44.1/48 kHz) — sending those
+// samples labeled as 16 kHz makes Whisper hear 3x-slowed audio and emit
+// garbage. Always resample from the ACTUAL context rate.
+function resampleTo16k(input, fromRate) {
+  if (fromRate === 16000) return input;
+  const ratio = fromRate / 16000;
+  const outLen = Math.floor(input.length / ratio);
+  const out = new Float32Array(outLen);
+  for (let i = 0; i < outLen; i++) {
+    const pos = i * ratio;
+    const i0 = Math.floor(pos);
+    const i1 = Math.min(i0 + 1, input.length - 1);
+    out[i] = input[i0] + (input[i1] - input[i0]) * (pos - i0);
+  }
+  return out;
+}
+
+async function start() {
+  errorEl.textContent = '';
+  chunks = 0; bytesSent = 0; lastChunk = 0;
+  try {
+    ws = new WebSocket(`ws://${location.host}/ws`);
+    ws.binaryType = 'arraybuffer';
+    ws.onopen = () => {
+      // hub protocol: hello, then meeting_start, then binary PCM16 frames
+      ws.send(JSON.stringify({type: 'hello', device_id: 'desktop-capture',
+                              role: 'desktop'}));
+      // no title: the hub auto-titles the memory from what was actually said.
+      // capture_device=desktop -> NMO source/device = "desktop" (plan §3/§4a)
+      ws.send(JSON.stringify({type: 'meeting_start',
+                              capture_device: 'desktop'}));
+      dot.classList.add('live');
+      status.textContent = 'streaming';
+    };
+    ws.onclose = () => {
+      dot.classList.remove('live');
+      status.textContent = 'disconnected';
+      renderDebug();
+    };
+    ws.onerror = () => { errorEl.textContent += '\nWebSocket error'; };
+    ws.onmessage = (e) => {
+      try {
+        const m = JSON.parse(e.data);
+        if (m.type === 'meeting_started')
+          status.textContent = `streaming · ${m.meeting_id}`;
+        if (m.type === 'event' && m.topic === 'transcript' && m.data.text)
+          errorEl.textContent = '';   // ASR alive
+        if (m.type === 'event' && m.topic === 'transcript' && m.data.error)
+          errorEl.textContent = m.data.error;
+      } catch (err) {}
+    };
+
+    stream = await navigator.mediaDevices.getUserMedia(
+      {audio: {channelCount: 1, sampleRate: 16000}});
+
+    audioCtx = new AudioContext({sampleRate: 16000});
+    // Awaiting getUserMedia's permission prompt can consume the button tap's
+    // user-activation, leaving a freshly created AudioContext 'suspended' -
+    // onaudioprocess then silently never fires. Force it awake explicitly.
+    if (audioCtx.state === 'suspended') await audioCtx.resume();
+
+    source = audioCtx.createMediaStreamSource(stream);
+    processor = audioCtx.createScriptProcessor(2048, 1, 1); // ~128 ms @ 16 kHz
+    source.connect(processor);
+    processor.connect(audioCtx.destination);
+    processor.onaudioprocess = (e) => {
+      chunks++;
+      const raw = e.inputBuffer.getChannelData(0);
+      const pcm16 = floatTo16BitPCM(resampleTo16k(raw, audioCtx.sampleRate));
+      lastChunk = pcm16.buffer.byteLength;
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(pcm16.buffer);
+        bytesSent += lastChunk;
+      }
+    };
+
+    btn.textContent = 'Stop capture';
+    btn.classList.add('stop');
+  } catch (e) {
+    errorEl.textContent = `start() failed: ${e.name}: ${e.message}`;
+    live = false;
+    btn.textContent = 'Start capture';
+    btn.classList.remove('stop');
+  }
+  renderDebug();
+}
+
+function stop() {
+  if (processor) processor.disconnect();
+  if (source) source.disconnect();
+  if (audioCtx) audioCtx.close();
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({type: 'meeting_end'}));
+    setTimeout(() => ws.close(), 500);   // let the ack arrive
+  } else if (ws) ws.close();
+  btn.textContent = 'Start capture';
+  btn.classList.remove('stop');
+  renderDebug();
+}
+
+btn.addEventListener('click', async () => {
+  live = !live;
+  if (live) await start(); else stop();
+});
+</script>
+</body>
+</html>

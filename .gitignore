@@ -2,4 +2,16 @@ plans
 .venv
 __pycache__
 *.db
+*.db-shm
+*.db-wal
 .pytest_cache
+*.egg-info
+build/
+dist/
+logs/
+*.log
+# on-device model binaries (see pc/models/README.md)
+pc/models/*.onnx
+pc/models/*.bin
+pc/models/*.json
+.env

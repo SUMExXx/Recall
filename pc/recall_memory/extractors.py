@@ -85,10 +85,38 @@ def extract_decisions(text: str, speaker: str = "") -> list[dict]:
     return out
 
 
-def llm_extract_relation(sentence: str, cfg=None) -> dict | None:
-    """Escalation hook for ambiguous spans (plan §6). Off by default.
+def llm_extract_relation(sentence: str, llm=None) -> dict | None:
+    """Escalation hook for ambiguous spans (plan §6): one (subject, predicate,
+    object) triple via the backend LLM (Qwen3-4B on the NPU, llama3.2 on Ollama).
 
-    Wire to the local LLM (Qwen3-4B on the event PC, llama3.2 via Ollama here)
-    with the single-sentence prompt: extract (subject, predicate, object).
+    Returns None when no LLM is available — the cheap extractors already handled
+    the confident cases, so this is a no-op on the offline/hash backend.
     """
-    return None
+    if llm is None or not getattr(llm, "available", False):
+        return None
+    import json
+
+    from .llm_validate import is_valid_relation
+    from .tracing import step
+    prompt = ("Extract exactly one (subject, predicate, object) triple from the "
+             'sentence as JSON: {"subject":"","predicate":"","object":""}. '
+             f"Sentence: {sentence}")
+    with step("extract_relation:llm_fallback",
+             model=getattr(llm, "model", llm.name)) as s:
+        s.detail(prompt=prompt)
+        try:
+            out = llm.generate(prompt, json=True, timeout=60)
+            s.detail(response=out)
+            d = json.loads(out)
+        except Exception as e:
+            s.detail(error=str(e))
+            return None
+        if not d.get("subject") or not d.get("object"):
+            return None
+        if not is_valid_relation(d["subject"], d["object"], sentence):
+            s.detail(rejected="object shares no vocabulary with the source "
+                             "sentence — likely hallucinated")
+            return None
+    return {"subject": d["subject"],
+            "predicate": d.get("predicate", "related_to"),
+            "object": d["object"]}
