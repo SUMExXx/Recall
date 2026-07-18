@@ -1,0 +1,4 @@
+numpy
+requests
+sqlite-vec>=0.1.7
+pytest
