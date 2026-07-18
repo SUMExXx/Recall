@@ -29,18 +29,33 @@ def main():
     if args.backend:
         os.environ["RECALL_BACKEND"] = args.backend
 
+    from hub.asr import make_local_whisper
+    from recall_memory.backends import get_backend
+    from recall_memory.config import RecallConfig
+    cfg = RecallConfig(db_path=args.db)
+
     if not args.no_seed:
-        from recall_memory.backends import get_backend
-        from recall_memory.config import RecallConfig
         from recall_memory.demo_data import seed
         from recall_memory.ingest import Ingestor
         from recall_memory.store import MemoryStore
-        cfg = RecallConfig(db_path=args.db)
         store = MemoryStore(args.db)
         if store.stats()["memories"] == 0:
             seed(Ingestor(store, cfg, get_backend(cfg)))
             print(f"seeded demo data into {args.db} (backend={cfg.backend})")
         store.close()
+
+    asr = make_local_whisper(cfg)
+    asr_how = (f"in-process faster-whisper ({cfg.whisper_model})"
+               if type(asr).__name__ == "FasterWhisperProvider"
+               else f"http server at {cfg.whisper_url}")
+    print(f"""
+Recall PC Hub
+  backend    {cfg.backend}   (RECALL_BACKEND / pc/.env)
+  db         {args.db}
+  asr        {asr_how}
+  dashboard  http://localhost:{args.port}
+  mic        http://localhost:{args.port}/capture
+""")
 
     import uvicorn
     uvicorn.run("hub.app:app", host="127.0.0.1", port=args.port)

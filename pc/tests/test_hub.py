@@ -13,7 +13,9 @@ import anyio
 from fastapi.testclient import TestClient
 
 import hub.app as hub_app
-from hub.asr import PassthroughProvider, select_provider, transcribe_with_fallback
+from hub.asr import (FasterWhisperProvider, PassthroughProvider,
+                     WhisperLocalProvider, make_local_whisper, select_provider,
+                     transcribe_with_fallback)
 from hub.mcp_server import build_server
 from hub.policy import PolicyEngine
 from hub.proactive import ProactiveRecallEngine
@@ -80,6 +82,15 @@ def test_asr_selection_policy():
     assert select_provider("hi", 0.9, p, providers) is providers["hinglish_local"]
     res = transcribe_with_fallback({"text": "namaste"}, "hi", 0.9, p, providers)
     assert res.text == "namaste"
+
+
+def test_make_local_whisper_modes():
+    cfg = RecallConfig(backend="hash")
+    # auto: faster-whisper is installed in this venv -> in-process provider
+    assert isinstance(make_local_whisper(cfg), FasterWhisperProvider)
+    # http: always the external-server contract
+    cfg_http = RecallConfig(backend="hash", asr_mode="http")
+    assert isinstance(make_local_whisper(cfg_http), WhisperLocalProvider)
 
 
 # ------------------------------------------------------------ proactive
@@ -265,6 +276,15 @@ def test_ws_audio_ingest(client, state, monkeypatch):
         assert msg["memory_id"]
     sess_mem = state.store.get_memory(msg["memory_id"])
     assert "hello from audio" in sess_mem["content"]
+
+
+def test_ws_events_legacy_alias(client, state):
+    """Old 1.0 dashboards connect to /ws/events — must work, not 403."""
+    with client.websocket_connect("/ws/events") as ws:
+        ws.send_text(json.dumps({"type": "hello", "device_id": "old-dash",
+                                 "role": "dashboard"}))
+        welcome = json.loads(ws.receive_text())
+        assert welcome["type"] == "welcome" and welcome["resume_token"]
 
 
 def test_links_and_digest(client, state):

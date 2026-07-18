@@ -1,17 +1,22 @@
 """ASRProvider workers — plan §2's interface, hub-side.
 
 Providers:
+  FasterWhisperProvider   in-process Whisper (faster-whisper, CPU int8) — the
+                          zero-setup default on the laptop; no external server
   WhisperLocalProvider    posts WAV bytes to a whisper.cpp-contract /inference
-                          endpoint (dev: server/scripts/dev_whisper_server.py
-                          from Recall 1.0; event PC: ORT-QNN Whisper-Base-En)
+                          endpoint (event PC: ORT-QNN Whisper-Base-En server)
   PassthroughProvider     dev shortcut for clients that send text utterances
   HinglishLocalProvider   BYOM Oriserve slot (falls back to Whisper here)
   SarvamCloudProvider     policy-gated opt-in; NEVER called unless the policy
                           engine allows it (3s timeout -> Hinglish -> Whisper)
+
+`make_local_whisper(cfg)` picks in-process vs HTTP per `RECALL_ASR_MODE`.
 """
 from __future__ import annotations
 
+import io
 import math
+import wave
 from dataclasses import dataclass, field
 
 
@@ -34,6 +39,53 @@ class PassthroughProvider:
     def capabilities(self) -> dict:
         return {"langs": ["*"], "word_ts": False, "diarization": False,
                 "offline": True, "codemix": True}
+
+
+class FasterWhisperProvider:
+    """In-process Whisper via faster-whisper (CTranslate2, CPU int8).
+
+    WAV bytes in, ASRResult out — no external server to start. The model
+    (~74 MB for base.en) downloads to the HF cache on first transcription.
+    Keeps name "whisper_local" so provenance metadata stays consistent.
+    """
+
+    name = "whisper_local"
+
+    def __init__(self, model_name: str = "base.en"):
+        self.model_name = model_name
+        self._model = None
+
+    def _load(self):
+        if self._model is None:
+            from faster_whisper import WhisperModel
+            self._model = WhisperModel(self.model_name, device="cpu",
+                                       compute_type="int8")
+        return self._model
+
+    def transcribe(self, payload: dict) -> ASRResult:
+        """payload = {audio: bytes (wav, 16 kHz mono pcm16)}."""
+        import numpy as np
+        with wave.open(io.BytesIO(payload["audio"]), "rb") as w:
+            pcm = w.readframes(w.getnframes())
+        audio = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+        lang = "en" if self.model_name.endswith(".en") else None
+        segs_iter, info = self._load().transcribe(audio, beam_size=1,
+                                                  language=lang)
+        segments, texts, logprobs = [], [], []
+        for s in segs_iter:
+            segments.append({"t_start": s.start, "t_end": s.end, "text": s.text})
+            texts.append(s.text)
+            if s.avg_logprob is not None:
+                logprobs.append(s.avg_logprob)
+        conf = (min(1.0, math.exp(sum(logprobs) / len(logprobs)))
+                if logprobs else 0.9)
+        return ASRResult(text="".join(texts).strip(),
+                         lang=getattr(info, "language", "en") or "en",
+                         segments=segments, confidence=conf)
+
+    def capabilities(self) -> dict:
+        return {"langs": ["en"], "word_ts": False, "diarization": False,
+                "offline": True, "codemix": False}
 
 
 class WhisperLocalProvider:
@@ -91,6 +143,27 @@ class SarvamCloudProvider:
     def capabilities(self) -> dict:
         return {"langs": ["hi", "en", "+21 indic"], "word_ts": True,
                 "diarization": False, "offline": False, "codemix": True}
+
+
+def make_local_whisper(cfg):
+    """Resolve the whisper_local provider per cfg.asr_mode.
+
+    auto     in-process faster-whisper when the package is installed,
+             else the HTTP contract at cfg.whisper_url
+    embedded require in-process (clear error if faster-whisper is missing)
+    http     always the external server (event PC: ORT-QNN Whisper)
+    """
+    mode = getattr(cfg, "asr_mode", "auto")
+    if mode in ("auto", "embedded"):
+        try:
+            import faster_whisper  # noqa: F401 — availability probe only
+            return FasterWhisperProvider(cfg.whisper_model)
+        except ImportError:
+            if mode == "embedded":
+                raise RuntimeError(
+                    "RECALL_ASR_MODE=embedded needs the in-process ASR: "
+                    'pip install -e ".[asr]"')
+    return WhisperLocalProvider(cfg.whisper_url)
 
 
 def select_provider(lang: str, lang_prob: float, policy, providers: dict,

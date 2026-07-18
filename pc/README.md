@@ -64,26 +64,30 @@ Hub layers (`docs/system_architectures_v1.md` §4):
 
 ## Quick start (laptop)
 
+Tasks run through [`dev.py`](dev.py) — plain Python, no `make` needed, same on
+Windows / macOS / Linux:
+
 ```bash
-make setup                       # venv (py 3.12) + pip install -e .
-make test                        # 44 tests, offline (hash backend)
-make demo                        # seed sample cross-source data (BACKEND=ollama)
-make ask Q="Who decided to use JWT authentication?"
-make consolidate                 # MVP: dual-mic merge + dedup + contradictions + importance
-make consolidate FULL=1          # full Dream tier: + OKF, communities, summaries, entity resolution
+python dev.py setup                       # venv (py 3.12) + pip install -e ".[dev]"
+python dev.py test                        # 44 tests, offline (hash backend)
+python dev.py demo                        # seed sample cross-source data
+python dev.py ask "Who decided to use JWT authentication?"
+python dev.py consolidate                 # MVP: dual-mic merge + dedup + contradictions + importance
+python dev.py consolidate --full          # full Dream tier: + OKF, communities, summaries, entity resolution
 ```
 
-`make` targets take `BACKEND=ollama|npu|hash` (default `ollama`). Forget button:
+Every command takes `--backend ollama|npu|hash` (default `$RECALL_BACKEND` or
+`ollama`). The engine also installs a `recall` console script — e.g. the forget
+button:
 
 ```bash
-RECALL_BACKEND=ollama python -m recall_memory --db demo.db \
-    forget --meeting mtg-auth-sync --last-minutes 5
+recall --db demo.db --backend ollama forget --meeting mtg-auth-sync --last-minutes 5
 ```
 
 ## Running the hub
 
 ```bash
-python scripts/run_hub.py --backend ollama   # seeds demo_hub.db, serves :8000
+python dev.py hub --port 8000            # seeds demo_hub.db, serves :8000
 ```
 
 - Dashboard: http://localhost:8000 · web-mic capture: http://localhost:8000/capture

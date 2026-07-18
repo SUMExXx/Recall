@@ -35,6 +35,15 @@ def _open(args) -> tuple[MemoryStore, RecallConfig]:
 
 
 def main(argv=None) -> int:
+    """Entry point — turns backend/runtime errors into a clean message."""
+    try:
+        return _main(argv)
+    except RuntimeError as e:
+        print(f"\n{e}", file=sys.stderr)
+        return 1
+
+
+def _main(argv=None) -> int:
     p = argparse.ArgumentParser(prog="recall_memory", description=__doc__)
     p.add_argument("--db", default="recall.db")
     p.add_argument("--backend", default=None, choices=["npu", "ollama", "hash"],

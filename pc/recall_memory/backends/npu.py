@@ -28,6 +28,21 @@ _QNN_PROVIDERS = ["QNNExecutionProvider", "CPUExecutionProvider"]
 _QNN_PROVIDER_OPTIONS = [{"backend_path": "QnnHtp.dll"}, {}]
 _NOMIC_TOKENIZER = "nomic-ai/nomic-embed-text-v1.5"
 
+_NO_RUNTIME_MSG = (
+    "RECALL_BACKEND=npu needs the on-device runtime, which isn't installed here.\n"
+    "  - laptop, semantic quality : --backend ollama  (or RECALL_BACKEND=ollama; needs Ollama running)\n"
+    "  - laptop, zero-setup check : --backend hash     (offline, deterministic)\n"
+    "  - Snapdragon X Elite PC    : pip install -e \".[npu]\"  + drop assets in models/"
+)
+
+
+def _require_onnxruntime():
+    try:
+        import onnxruntime as ort
+        return ort
+    except ModuleNotFoundError as e:
+        raise RuntimeError(_NO_RUNTIME_MSG) from e
+
 
 class NomicQnnEmbedder:
     """Nomic v1.5 on the NPU. Two static graphs (seqlen 256 / 512); the shorter
@@ -42,7 +57,7 @@ class NomicQnnEmbedder:
         self._tok = None
 
     def _session(self, seqlen: int):
-        import onnxruntime as ort
+        ort = _require_onnxruntime()
         if seqlen not in self._sessions:
             path = (self.cfg.npu_embed_onnx_256 if seqlen <= 256
                     else self.cfg.npu_embed_onnx_512)

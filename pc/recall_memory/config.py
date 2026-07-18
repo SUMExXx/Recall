@@ -84,7 +84,8 @@ class RecallConfig(BaseSettings):
     """Runtime configuration. Reads `RECALL_*` env vars; kwargs override env."""
 
     model_config = SettingsConfigDict(
-        env_prefix="RECALL_", extra="ignore", populate_by_name=True)
+        env_prefix="RECALL_", extra="ignore", populate_by_name=True,
+        env_file=".env", env_file_encoding="utf-8")
 
     # --- the one switch --------------------------------------------------
     backend: Backend = "npu"
@@ -113,6 +114,11 @@ class RecallConfig(BaseSettings):
     # HF tokenizer id used for exact on-device token budgeting.
     npu_tokenizer_id: str = "Qwen/Qwen3-4B"
 
-    # --- ASR services (shared; the backend points these at the right one) -
-    whisper_url: str = "http://localhost:8080"     # Whisper-Base-En (dev: whisper.cpp)
+    # --- ASR ---------------------------------------------------------------
+    # auto (default): transcribe in-process via faster-whisper when installed,
+    #   else fall back to the HTTP contract below. embedded: require in-process.
+    #   http: always use the external server (the event PC's ORT-QNN Whisper).
+    asr_mode: Literal["auto", "embedded", "http"] = "auto"
+    whisper_model: str = "base.en"                 # faster-whisper model (in-process)
+    whisper_url: str = "http://localhost:8080"     # http mode: whisper.cpp contract
     hinglish_url: str = "http://localhost:8081"    # Oriserve Hinglish BYOM slot

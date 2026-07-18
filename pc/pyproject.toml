@@ -24,6 +24,7 @@ dependencies = [
     "requests>=2.31",
     "mcp>=1.2",
     "tokenizers>=0.20",
+    "python-dotenv>=1.0",
 ]
 
 [project.optional-dependencies]
@@ -34,6 +35,11 @@ npu = [
     "onnxruntime-qnn; platform_machine == 'ARM64'",  # QNN EP: Nomic v1.5, Whisper, reranker
     "transformers>=4.44",                            # AutoTokenizer for Qwen3 / Nomic
     "onnx>=1.16",
+]
+# In-process ASR for the dev laptop (x64) — the event PC uses ORT-QNN Whisper
+# over HTTP instead, so this stays optional (ctranslate2 has no ARM64 wheel).
+asr = [
+    "faster-whisper>=1.0",
 ]
 dev = [
     "pytest>=8",

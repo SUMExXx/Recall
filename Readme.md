@@ -14,7 +14,7 @@ The build targets the **Snapdragon X Elite / NPU**. A single switch,
 
 ```bash
 cd pc
-make setup
-make test                 # 44 tests, offline
-make demo BACKEND=ollama  # try it on your laptop
+python dev.py setup
+python dev.py test                    # 44 tests, offline
+python dev.py demo --backend ollama   # try it on your laptop
 ```

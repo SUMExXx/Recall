@@ -49,7 +49,7 @@ from recall_memory.retrieval import Retriever
 from recall_memory.store import MemoryStore
 
 from .asr import (HinglishLocalProvider, PassthroughProvider,
-                  SarvamCloudProvider, WhisperLocalProvider,
+                  SarvamCloudProvider, make_local_whisper,
                   transcribe_with_fallback)
 from .metrics import Metrics
 from .policy import PolicyEngine
@@ -163,7 +163,7 @@ class HubState:
         self.proactive = ProactiveRecallEngine(self.retriever)
         self.asr_providers = {
             "passthrough": PassthroughProvider(),
-            "whisper_local": WhisperLocalProvider(cfg.whisper_url),
+            "whisper_local": make_local_whisper(cfg),   # in-process or HTTP
             "hinglish_local": HinglishLocalProvider(cfg.hinglish_url),
             "sarvam_cloud": SarvamCloudProvider(),
         }
@@ -505,21 +505,27 @@ async def digest_ep():
             "latency_ms": round((time.perf_counter() - t0) * 1000)}
 
 
+_NO_CACHE = {"Cache-Control": "no-store"}   # stale dashboards caused /ws 403s
+
+
 @app.get("/")
 async def dashboard():
     return FileResponse(os.path.join(os.path.dirname(__file__),
-                                     "dashboard", "index.html"))
+                                     "dashboard", "index.html"),
+                        headers=_NO_CACHE)
 
 
 @app.get("/capture")
 async def capture_page():
     return FileResponse(os.path.join(os.path.dirname(__file__),
-                                     "dashboard", "capture.html"))
+                                     "dashboard", "capture.html"),
+                        headers=_NO_CACHE)
 
 
 # ------------------------------------------------------------------- WS
 
 @app.websocket("/ws")
+@app.websocket("/ws/events")   # legacy 1.0-dashboard path — stale tabs got 403
 async def ws_endpoint(ws: WebSocket):
     s = get_state()
     await ws.accept()
