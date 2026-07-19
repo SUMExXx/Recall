@@ -18,7 +18,7 @@ import '../pipeline/vector_store.dart';
 class SyncedMemory implements VectorStore {
   /// PC hub to sync to on first run (before the user sets one in the dialog).
   /// Hardcoded to the event PC's LAN IP; the hub serves the sync socket at /ws.
-  static const String _defaultServerUrl = 'ws://10.20.3.196:8000/ws';
+  static const String _defaultServerUrl = 'ws://10.119.11.123:8000/ws';
 
   final VectorStore _local;
   final Database _db;

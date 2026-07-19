@@ -40,22 +40,45 @@ class MemoryPipeline {
   bool _askMode = false; // true while the Ask tab is active
 
   // ---- Wake word ("Hey Recall") ----------------------------------------
-  // Matches "hey recall" and the ways Whisper commonly mishears it
-  // ("hey, recall", "hey rekall", "hey record"). Case/punctuation-insensitive.
-  static final RegExp _wakeRe =
-      RegExp(r'hey[\s,]+re[ck]a?o?l?l|hey[\s,]+record', caseSensitive: false);
+  // On-device Whisper (tiny.en) mishears the wake phrase constantly, so an
+  // exact/near-exact regex misses most of the time. We instead scan the first
+  // few words for a "recall"-like token (edit-distance tolerant + a curated
+  // mishear set), optionally led by a "hey"-like filler. Deliberately biased
+  // toward recall over precision: a stray trigger just opens the orb for a few
+  // seconds, whereas a missed one silently loses the whole memory.
+  static const Set<String> _recallLike = {
+    'recall', 'recalls', 'rekall', 'rekal', 'recal', 'recoll', 'regall',
+    'ricall', 'recalled', 'record', 'records', 'recording', 'reccall',
+  };
+  static const Set<String> _recallDeny = {
+    'recent', 'recently', 'receive', 'received', 'recipe', 'reception',
+    'recommend', 'recover', 'require', 'research',
+  };
+  static const Set<String> _heyLike = {
+    'hey', 'hay', 'ey', 'ay', 'hi', 'ok', 'okay', 'a', 'eh', 'yo',
+  };
 
   /// When true, utterances are ignored until the wake word is heard; only then
   /// is speech saved to memory. When false, every utterance is saved (the
   /// original always-on behaviour).
   bool _wakeMode = true;
-  DateTime? _awakeUntil;
+  bool _awake = false;
   Timer? _wakeTimer;
   final _listening = StreamController<bool>.broadcast();
+  // Accumulated message for the current wake window: on-device VAD splits on
+  // ~0.5 s of silence, so one spoken message arrives as several segments. We
+  // gather them all and save the concatenation when speech stops, instead of
+  // capturing only the first segment and dropping the rest.
+  final StringBuffer _msg = StringBuffer();
+  Float32List? _msgSamples; // first content segment, used for speaker id
 
-  /// Safety timeout: if the wake word opens the orb but no message follows, the
-  /// orb auto-hides after this. A captured message closes it sooner.
+  /// Max wait, after the wake word, for the message to START before the orb
+  /// auto-hides with nothing captured.
   static const Duration _awakeWindow = Duration(seconds: 12);
+
+  /// Once the message is under way, this much trailing silence marks its end —
+  /// the accumulated text is saved and the orb closes.
+  static const Duration _trailingSilence = Duration(seconds: 4);
 
   MemoryPipeline._(this._capture, this._speaker, this._transcriber, this._store,
       this._synced, this._inference);
@@ -103,36 +126,108 @@ class MemoryPipeline {
   /// Turns wake-word gating on/off. Off = save every utterance (original mode).
   void setWakeWord(bool on) {
     _wakeMode = on;
-    if (!on) _closeWindow(); // stop gating; any open orb hides
+    if (!on) _flushAndClose(); // stop gating; save anything pending, hide orb
   }
 
-  bool get _isAwake =>
-      _awakeUntil != null && DateTime.now().isBefore(_awakeUntil!);
+  bool get _isAwake => _awake;
+
+  /// (Re)arm the wake timer for [d]; when it fires, whatever was accumulated is
+  /// saved and the window closes.
+  void _armTimer(Duration d) {
+    _wakeTimer?.cancel();
+    _wakeTimer = Timer(d, _flushAndClose);
+  }
 
   void _openWindow() {
-    final wasClosed = !_isAwake;
-    _awakeUntil = DateTime.now().add(_awakeWindow);
-    _wakeTimer?.cancel();
-    _wakeTimer = Timer(_awakeWindow, _closeWindow);
-    if (wasClosed) _listening.add(true);
+    if (!_awake) {
+      _awake = true;
+      _listening.add(true);
+    }
+    _armTimer(_awakeWindow); // wait for the message to start
   }
 
   void _closeWindow() {
     _wakeTimer?.cancel();
     _wakeTimer = null;
-    if (_awakeUntil != null) {
-      _awakeUntil = null;
+    if (_awake) {
+      _awake = false;
       _listening.add(false);
     }
   }
 
-  /// If [text] contains the wake word, returns whatever was said after it
-  /// (possibly empty); otherwise null.
+  /// Append a message segment and reset the trailing-silence timer so a message
+  /// spoken over several VAD segments is gathered into one memory.
+  void _appendMessage(String text, Float32List samples) {
+    final t = text.trim();
+    if (t.isEmpty) return;
+    if (_msg.isNotEmpty) _msg.write(' ');
+    _msg.write(t);
+    _msgSamples ??= samples;
+    _armTimer(_trailingSilence);
+  }
+
+  /// Save the accumulated message (if any) and close the window. Runs from the
+  /// timer; the save is serialized onto the same tail as live utterances.
+  void _flushAndClose() {
+    final text = _msg.toString().trim();
+    final samples = _msgSamples;
+    _msg.clear();
+    _msgSamples = null;
+    if (text.isNotEmpty && samples != null) {
+      _tail = _tail.then((_) => _consume(text, samples));
+    }
+    _closeWindow();
+  }
+
+  /// If [text] begins with the wake word (fuzzily — see [_recallLike]), returns
+  /// whatever was said after it (possibly empty); otherwise null.
   static String? _afterWakeWord(String text) {
-    final m = _wakeRe.firstMatch(text);
-    if (m == null) return null;
-    // Drop leading punctuation Whisper leaves after the wake phrase.
-    return text.substring(m.end).replaceFirst(RegExp(r'^[\s,.!?:;-]+'), '').trim();
+    // Tokenize with end offsets so we can return the original-cased remainder.
+    final words = RegExp(r'\S+').allMatches(text).toList();
+    final scan = words.length < 5 ? words.length : 5; // wake word is up front
+    for (var i = 0; i < scan; i++) {
+      if (!_isRecallLike(words[i][0]!)) continue;
+      // Accept if it's at the very start, or a "hey"-like filler precedes it —
+      // this keeps a mid-sentence "record" from falsely waking.
+      final led = i == 0 ||
+          _heyLike.contains(_norm(words[i - 1][0]!));
+      if (!led) continue;
+      return text
+          .substring(words[i].end)
+          .replaceFirst(RegExp(r'^[\s,.!?:;-]+'), '')
+          .trim();
+    }
+    return null;
+  }
+
+  static String _norm(String w) => w.toLowerCase().replaceAll(RegExp(r'[^a-z]'), '');
+
+  /// Whether a token is a plausible (mis)hearing of "recall"/"record".
+  static bool _isRecallLike(String word) {
+    final w = _norm(word);
+    if (w.length < 4 || w.length > 9) return false;
+    if (_recallDeny.contains(w)) return false;
+    if (_recallLike.contains(w)) return true;
+    // Distance 1 only: distance 2 would pull in "call" and wake mid-sentence.
+    return _lev(w, 'recall') <= 1 || _lev(w, 'record') <= 1;
+  }
+
+  /// Levenshtein edit distance (small strings, so the simple DP is fine).
+  static int _lev(String a, String b) {
+    final prev = List<int>.generate(b.length + 1, (i) => i);
+    final cur = List<int>.filled(b.length + 1, 0);
+    for (var i = 1; i <= a.length; i++) {
+      cur[0] = i;
+      for (var j = 1; j <= b.length; j++) {
+        final cost = a[i - 1] == b[j - 1] ? 0 : 1;
+        cur[j] = [cur[j - 1] + 1, prev[j] + 1, prev[j - 1] + cost]
+            .reduce((x, y) => x < y ? x : y);
+      }
+      for (var j = 0; j <= b.length; j++) {
+        prev[j] = cur[j];
+      }
+    }
+    return prev[b.length];
   }
 
   void _enqueue(Float32List samples) {
@@ -156,30 +251,27 @@ class MemoryPipeline {
     if (text.isEmpty) return;
     if (!isLikelyLanguage(text)) return; // discard mis-transcribed noise
 
-    if (_wakeMode && !_isAwake) {
+    if (!_wakeMode) {
+      // Wake mode off: save every utterance immediately, no orb.
+      await _consume(text, samples);
+      return;
+    }
+
+    if (!_isAwake) {
       // Asleep: only the wake word matters. Anything else is ignored.
       final after = _afterWakeWord(text);
       if (after == null) return;
-      _openWindow(); // orb rises
-      if (after.isNotEmpty) {
-        // Whole message came in one breath → capture it and close the orb now.
-        await _consume(after, samples);
-        _closeWindow();
-      }
-      // Otherwise wait for the follow-up utterance (or the safety timeout).
+      _openWindow(); // orb rises; wait for (the rest of) the message
+      // Whatever followed the wake word in this same breath starts the message;
+      // further VAD segments are appended until _trailingSilence of quiet, so a
+      // message spoken with pauses isn't truncated to its first segment.
+      if (after.isNotEmpty) _appendMessage(after, samples);
       return;
     }
 
-    if (_wakeMode) {
-      // Awake: this utterance is the message we opened the orb for. Capture it,
-      // then close — one wake word captures one message.
-      await _consume(text, samples);
-      _closeWindow();
-      return;
-    }
-
-    // Wake mode off: save every utterance, no orb.
-    await _consume(text, samples);
+    // Awake: this segment is (part of) the message. Accumulate; the trailing-
+    // silence timer saves the whole thing and closes the orb once speech stops.
+    _appendMessage(text, samples);
   }
 
   /// Terminal action for a captured utterance: in ask mode it becomes a spoken
