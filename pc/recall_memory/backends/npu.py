@@ -8,15 +8,21 @@ the runtime present. On the laptop, use `RECALL_BACKEND=ollama` instead.
 
   Embedder  Nomic-Embed-Text v1.5, ORT-QNN, re-exported seqlen 256/512 graphs
             (float[768], mean-pooled + L2-normed; task prefixes)
-  LLM       Qwen3-4B-Instruct-2507 (w4a16) via GenieX/QAIRT, fronted by an
-            OpenAI-compatible HTTP endpoint (genie sidecar)
+  LLM       Qwen3-4B-Instruct-2507 via GenieX — either in-process through the
+            `geniex` package (auto-downloads the precompiled AI Hub bundle,
+            runs on the Hexagon NPU via the qairt plugin) or an external
+            OpenAI-compatible HTTP endpoint (`geniex serve`). `npu_llm_mode`
+            picks; `auto` prefers a running endpoint, else loads in-process.
   Reranker  Qwen3-Reranker-0.6B via ORT-QNN (falls back to passthrough order
             if the asset/runtime is missing)
   Tokenizer the model tokenizer (HF `tokenizers`)
 """
 from __future__ import annotations
 
+import importlib.util
 import json
+import logging
+import threading
 from functools import cached_property
 
 import numpy as np
@@ -24,6 +30,8 @@ import numpy as np
 from ..config import DIM_FULL, RecallConfig
 from ..embeddings import DOC_PREFIX, QUERY_PREFIX, _normalize
 from .base import Backend, PassthroughReranker
+
+log = logging.getLogger("recall.backends.npu")
 
 _QNN_PROVIDERS = ["QNNExecutionProvider", "CPUExecutionProvider"]
 _QNN_PROVIDER_OPTIONS = [{"backend_path": "QnnHtp.dll"}, {}]
@@ -181,6 +189,103 @@ class QwenGenieLLM:
                 yield delta
 
 
+class GenieXInProcessLLM:
+    """Qwen3-4B-Instruct-2507 loaded in-process via the `geniex` package
+    (Qualcomm's on-device GenAI runtime, github.com/qualcomm/GenieX).
+
+    `AutoModelForCausalLM.from_pretrained("ai-hub-models/...")` pulls the
+    precompiled, chipset-matched AI Hub bundle into geniex's local cache on
+    first use and loads it on the Hexagon NPU (qairt plugin) — no sidecar to
+    start, no assets to drop in models/. The hub's startup warmup generate is
+    what triggers the download+load, so the first user query doesn't pay it.
+
+    Thread safety: the engine calls the LLM from threadpool workers, and one
+    NPU model handle must not run two generations at once — every call
+    serializes on `_lock` (streams hold it for the whole iteration).
+
+    JSON: `json_mode=True` grammar-constrains decoding to valid JSON. Schema
+    *conformance* is prompt-enforced only (geniex has no json_schema mode) —
+    callers on this contract already detect-and-retry malformed shapes.
+    """
+
+    name = "geniex-inprocess"
+
+    def __init__(self, cfg: RecallConfig):
+        self.cfg = cfg
+        self._model = None
+        self._lock = threading.Lock()
+        self._failed: Exception | None = None
+
+    @property
+    def available(self) -> bool:
+        return self._failed is None and importlib.util.find_spec("geniex") is not None
+
+    def _load(self):
+        """Load (downloading first if uncached) under the lock. Raises with a
+        pointed message on failure and remembers it so `available` flips off
+        instead of re-attempting a doomed multi-GB pull every call."""
+        if self._model is None:
+            if self._failed is not None:
+                raise RuntimeError(
+                    f"geniex model load already failed: {self._failed}") from self._failed
+            try:
+                from geniex import AutoModelForCausalLM
+                log.info("geniex: loading %s (device_map=%s) — downloads the "
+                         "AI Hub bundle on first run", self.cfg.npu_llm_model,
+                         self.cfg.npu_llm_device_map)
+                self._model = AutoModelForCausalLM.from_pretrained(
+                    self.cfg.npu_llm_model,
+                    device_map=self.cfg.npu_llm_device_map,
+                    progress=True)
+            except Exception as e:
+                self._failed = e
+                raise RuntimeError(
+                    f"geniex failed to load {self.cfg.npu_llm_model!r}: {e}\n"
+                    "  - is this a Snapdragon device? geniex runs only on Qualcomm SoCs\n"
+                    "  - first run needs network access to pull the AI Hub bundle\n"
+                    "  - or run `geniex serve` separately and set RECALL_NPU_LLM_MODE=endpoint"
+                ) from e
+        return self._model
+
+    def _prompt(self, model, prompt: str) -> str:
+        # enable_thinking=False skips Qwen3's thinking turn — planner/extractor
+        # callers need the answer, not reasoning tokens, and streamed thinking
+        # would leak into spoken answers. geniex forces it back to True (with
+        # a warning) on models with no thinking mode, so this is always safe.
+        return model.tokenizer.apply_chat_template(
+            [{"role": "user", "content": prompt}],
+            add_generation_prompt=True, enable_thinking=False)
+
+    def generate(self, prompt: str, *, json: bool = False,
+                 schema: dict | None = None, timeout: float = 180.0) -> str:
+        import json as _json
+        if schema is not None:
+            prompt += ("\n\nRespond with ONLY a JSON object that matches this "
+                       "JSON Schema — no prose, no code fences:\n"
+                       + _json.dumps(schema))
+        with self._lock:
+            model = self._load()
+            out = model.generate(
+                self._prompt(model, prompt),
+                max_new_tokens=self.cfg.npu_llm_max_new_tokens,
+                json_mode=bool(json or schema is not None))
+        return out.text.strip()
+
+    def generate_stream(self, prompt: str, *, timeout: float = 180.0):
+        """Yields text deltas. GenerateOutput's <think>-stripping only exists
+        on the blocking path, but the template already suppresses the thinking
+        turn, so deltas stream clean."""
+        with self._lock:
+            model = self._load()
+            streamer = model.generate(
+                self._prompt(model, prompt),
+                max_new_tokens=self.cfg.npu_llm_max_new_tokens,
+                stream=True)
+            for chunk in streamer:
+                if chunk:
+                    yield chunk
+
+
 class QwenQnnReranker:
     """Qwen3-Reranker-0.6B cross-encoder on the NPU via ORT-QNN.
 
@@ -234,7 +339,31 @@ class NpuBackend(Backend):
 
     @cached_property
     def llm(self):
-        return QwenGenieLLM(self.cfg)
+        """npu_llm_mode picks the serving path (decided once, at first use):
+        endpoint — the external OpenAI-compatible server, always
+        geniex   — in-process via the geniex package, always
+        auto     — a server already listening on npu_llm_endpoint wins (so an
+                   operator-managed `geniex serve` is respected); otherwise
+                   load in-process, which auto-downloads the AI Hub bundle.
+                   With neither, the HTTP client's available=False keeps the
+                   engine's existing no-LLM degradation."""
+        mode = self.cfg.npu_llm_mode
+        if mode == "endpoint":
+            return QwenGenieLLM(self.cfg)
+        if mode == "geniex":
+            return GenieXInProcessLLM(self.cfg)
+        http = QwenGenieLLM(self.cfg)
+        if http.available:
+            log.info("npu llm: using running endpoint %s", self.cfg.npu_llm_endpoint)
+            return http
+        inproc = GenieXInProcessLLM(self.cfg)
+        if inproc.available:
+            log.info("npu llm: no endpoint up — in-process geniex (%s)",
+                     self.cfg.npu_llm_model)
+            return inproc
+        log.warning("npu llm: no endpoint at %s and geniex not installed — "
+                    "LLM unavailable", self.cfg.npu_llm_endpoint)
+        return http
 
     @cached_property
     def reranker(self):

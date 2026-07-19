@@ -43,6 +43,11 @@ dependencies = [
 # imports and runs (on the ollama/hash backend) without any of these present.
 npu = [
     "onnxruntime-qnn; platform_machine == 'ARM64'",  # QNN EP: Nomic v1.5, Whisper, reranker
+    # In-process LLM: auto-pulls the precompiled AI Hub bundle and runs it on
+    # the Hexagon NPU (npu_llm_mode auto/geniex). Pure-python sdist (native
+    # runtime fetched by the package itself) — installs with no compiler.
+    # Only functions on Snapdragon, hence the marker.
+    "geniex>=0.3; platform_machine == 'ARM64'",
     "transformers>=4.44",                            # AutoTokenizer for Qwen3 / Nomic
     "onnx>=1.16",
 ]

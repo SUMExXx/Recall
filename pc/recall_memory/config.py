@@ -125,9 +125,21 @@ class RecallConfig(BaseSettings):
     # Embedder: Nomic-Embed-Text v1.5 re-exported at seqlen 256/512, ORT-QNN.
     npu_embed_onnx_256: str = "models/nomic-v1.5-seq256.onnx"
     npu_embed_onnx_512: str = "models/nomic-v1.5-seq512.onnx"
-    # LLM: Qwen3-4B-Instruct-2507 (w4a16) served by GenieX/QAIRT over HTTP.
+    # LLM serving mode:
+    #   auto     — use npu_llm_endpoint if a server is already up there, else
+    #              load the model in-process via the `geniex` package (which
+    #              auto-downloads the precompiled AI Hub bundle on first use)
+    #   geniex   — always in-process via geniex (no sidecar to start)
+    #   endpoint — only the external OpenAI-compatible server (never in-process)
+    npu_llm_mode: Literal["auto", "geniex", "endpoint"] = "auto"
+    # Model id: a Qualcomm AI Hub bundle id (auto-pulled by geniex, NPU-ready)
+    # — also sent as the OpenAI `model` field in endpoint mode, matching how
+    # `geniex serve` names its models.
+    npu_llm_model: str = "ai-hub-models/Qwen3-4B-Instruct-2507"
+    # geniex device_map: npu (qairt) | cpu | gpu | hybrid (llama_cpp) | auto.
+    npu_llm_device_map: str = "npu"
+    npu_llm_max_new_tokens: int = 1024
     npu_llm_endpoint: str = "http://localhost:8090"
-    npu_llm_model: str = "qwen3-4b-instruct-2507"
     # Reranker: Qwen3-Reranker-0.6B via ORT-QNN (bge-reranker CPU fallback).
     npu_reranker_onnx: str = "models/qwen3-reranker-0.6b.onnx"
     # HF tokenizer id used for exact on-device token budgeting.
