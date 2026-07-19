@@ -13,7 +13,11 @@ import '../pipeline/vector_store.dart';
 /// `GENIE_UNAVAILABLE` and this falls back to returning the retrieved memories.
 class QualInferenceEngine implements InferenceEngine {
   static const MethodChannel _channel = MethodChannel('geniex');
-  static const int _contextMemories = 5;
+  // static const int _contextMemories = 5; // RAG retrieval size (disabled)
+  // ponytail: dumps EVERY memory into the prompt — fine while the store is
+  // small; restore the search() retrieval below before this outgrows the LLM
+  // context window.
+  static const int _allMemories = 1 << 30; // effectively unbounded
 
   final VectorStore _memory;
 
@@ -25,7 +29,9 @@ class QualInferenceEngine implements InferenceEngine {
 
   @override
   Future<String> ask(String question) async {
-    final context = await _memory.search(question, topK: _contextMemories);
+    // All memories go into the prompt for now — retrieval disabled.
+    // final context = await _memory.search(question, topK: _contextMemories);
+    final context = await _memory.recent(_allMemories);
     final prompt = _buildPrompt(question, context);
     try {
       final answer = await _channel.invokeMethod<String>('generate', {'prompt': prompt});

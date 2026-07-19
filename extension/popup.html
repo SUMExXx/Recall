@@ -6,39 +6,80 @@
   <link rel="stylesheet" href="popup.css" />
 </head>
 <body>
-  <header>
-    <span class="logo">Recall</span>
-    <span id="status-dot" class="dot dot-unknown" title="Hub connection status"></span>
-  </header>
-  <p id="status-text" class="muted">Checking hub connection…</p>
 
-  <!-- Feature buttons -->
-  <div class="feature-grid">
-    <button class="feature-btn" id="btn-screenshot">
-      <span class="feat-icon">📸</span>
-      <span class="feat-label">Screenshot<br>→ Memory</span>
+  <header>
+    <div class="logo-mark">
+      <!-- memory / node icon -->
+      <svg width="14" height="14" viewBox="0 0 14 14" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <circle cx="7" cy="7" r="2.5" fill="#f0a030"/>
+        <circle cx="2" cy="4"  r="1.2" fill="#a39b8a" opacity=".7"/>
+        <circle cx="12" cy="4" r="1.2" fill="#a39b8a" opacity=".7"/>
+        <circle cx="2" cy="10" r="1.2" fill="#a39b8a" opacity=".7"/>
+        <circle cx="12" cy="10" r="1.2" fill="#a39b8a" opacity=".7"/>
+        <line x1="4.5" y1="5.5"  x2="7"  y2="7"   stroke="#f0a030" stroke-width=".8" opacity=".5"/>
+        <line x1="9.5" y1="5.5"  x2="7"  y2="7"   stroke="#f0a030" stroke-width=".8" opacity=".5"/>
+        <line x1="4.5" y1="8.5"  x2="7"  y2="7"   stroke="#f0a030" stroke-width=".8" opacity=".5"/>
+        <line x1="9.5" y1="8.5"  x2="7"  y2="7"   stroke="#f0a030" stroke-width=".8" opacity=".5"/>
+      </svg>
+    </div>
+    <span class="logo-text">Re<span>call</span></span>
+    <div class="led-wrap">
+      <div class="led checking" id="status-dot"></div>
+      <span class="led-label" id="led-label">—</span>
+    </div>
+  </header>
+
+  <div class="status-bar" id="status-text">checking hub…</div>
+
+  <div class="section-label">capture</div>
+
+  <div class="action-grid">
+    <button class="action-btn" id="btn-screenshot">
+      <span class="btn-icon">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#f0a030" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="12" cy="12" r="3"/>
+          <path d="M3 9V6a1 1 0 0 1 1-1h3M21 9V6a1 1 0 0 0-1-1h-3M3 15v3a1 1 0 0 0 1 1h3M21 15v3a1 1 0 0 1-1 1h-3"/>
+        </svg>
+      </span>
+      <span class="btn-label">Screenshot</span>
     </button>
-    <button class="feature-btn" id="btn-save-pdf">
-      <span class="feat-icon">📄</span>
-      <span class="feat-label">Save this<br>PDF</span>
+
+    <button class="action-btn" id="btn-save-pdf">
+      <span class="btn-icon">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#f0a030" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+          <polyline points="14 2 14 8 20 8"/>
+          <line x1="8" y1="13" x2="16" y2="13"/><line x1="8" y1="17" x2="16" y2="17"/>
+        </svg>
+      </span>
+      <span class="btn-label">Save PDF</span>
     </button>
-    <button class="feature-btn" id="btn-save-github">
-      <span class="feat-icon">🗂️</span>
-      <span class="feat-label">Save GitHub<br>repo</span>
+
+    <button class="action-btn" id="btn-save-github">
+      <span class="btn-icon">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#f0a030" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M9 19c-5 1.5-5-2.5-7-3m14 6v-3.87a3.37 3.37 0 0 0-.94-2.61c3.14-.35 6.44-1.54 6.44-7A5.44 5.44 0 0 0 20 4.77 5.07 5.07 0 0 0 19.91 1S18.73.65 16 2.48a13.38 13.38 0 0 0-7 0C6.27.65 5.09 1 5.09 1A5.07 5.07 0 0 0 5 4.77a5.44 5.44 0 0 0-1.5 3.78c0 5.42 3.3 6.61 6.44 7A3.37 3.37 0 0 0 9 18.13V22"/>
+        </svg>
+      </span>
+      <span class="btn-label">GitHub repo</span>
     </button>
   </div>
-  <p id="feature-status" class="muted"></p>
 
-  <div class="divider"></div>
+  <p id="feature-status" class="feature-status"></p>
 
-  <!-- Manual text save -->
-  <textarea id="manual-text" placeholder="Paste or type anything to save as a memory…"></textarea>
-  <button id="save-btn" class="primary">Save memory</button>
-  <p id="save-status" class="muted"></p>
+  <hr class="divider" />
+
+  <div class="input-section">
+    <textarea id="manual-text" placeholder="paste or type anything to save as a memory…" rows="3"></textarea>
+    <div class="save-row">
+      <button id="save-btn" class="primary">→ save to memory</button>
+    </div>
+  </div>
+  <p id="save-status" class="save-status"></p>
 
   <footer>
-    <span id="hub-url" class="muted"></span>
-    <a href="#" id="open-options">Settings</a>
+    <span id="hub-url"></span>
+    <a href="#" id="open-options">settings</a>
   </footer>
 
   <script src="popup.js"></script>

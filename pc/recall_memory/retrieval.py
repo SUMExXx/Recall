@@ -579,16 +579,16 @@ class Retriever:
         if okf:
             okf_block = ("SOURCE OVERVIEW (skim this table of contents first):\n"
                          + json.dumps(okf, ensure_ascii=False)[:1200] + "\n\n")
-        return (
-            "You are Recall, a personal on-device memory assistant. Answer the "
-            "QUESTION using ONLY facts stated in the MEMORY EXCERPTS below — no "
-            "outside knowledge, no guessing. Write one short, direct, "
-            "natural-sounding answer in your own words — do not just copy an "
-            "excerpt verbatim, and ignore any filler or rambling in an excerpt "
-            "that isn't actually about the question. Cite the excerpt each "
-            "fact came from inline, like [abc12345:3]. If the excerpts don't "
-            "actually answer the question, reply exactly NOTFOUND.\n\n"
+        prompt = (
+            "You are Recall, an on-device memory assistant. Answer the question "
+            "directly and concisely using ONLY the memory excerpts below. State "
+            "the answer itself in the first sentence — do NOT say things like "
+            "'the answer can be found in the excerpt' or 'according to the "
+            "memory', and do NOT add citations, sources, or bracketed ids "
+            "(those are attached automatically). If the excerpts do not contain "
+            "the answer, reply exactly NOTFOUND.\n\n"
             f"{okf_block}MEMORY EXCERPTS:\n{context_str}\n\nQUESTION: {query}\nANSWER:")
+        return prompt
 
     def _synthesize(self, query: str, contexts: list[RetrievedContext],
                     okf: dict | None = None) -> str:
@@ -598,8 +598,15 @@ class Retriever:
                   prompt_chars=len(prompt)) as s:
             s.detail(prompt=prompt)
             try:
-                answer = self.llm.generate(prompt)
+                answer = self.llm.generate(prompt).strip()
                 s.detail(response=answer)
+                # Attach the REAL citation in code — the model can't be trusted
+                # to copy ids accurately (it parrots example ids). The top-ranked
+                # context is the primary source.
+                if answer and "NOTFOUND" not in answer.upper():
+                    top = contexts[0]
+                    src = top.chunk_title or top.title or top.source_type
+                    answer += f"\nSource: {top.citation()} ({src})"
                 return answer
             except Exception as e:
                 s.detail(fallback=f"LLM unavailable: {e}")

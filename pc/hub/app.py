@@ -319,6 +319,29 @@ class HubState:
             await asyncio.sleep(0)
             await self.set_led("capturing")
 
+    async def sync_memory(self, msg: dict) -> str:
+        """Persist a memory synced from the phone app's outbox
+        (`{id, timestamp, speaker, text}`). Each phone memory is already a
+        complete note, so it goes straight to the store as a document (not the
+        meeting/session path). Heavy embed+ingest runs off the event loop.
+        Returns the hub memory_id."""
+        text = (msg.get("text") or "").strip()
+        speaker = msg.get("speaker") or ""
+        title = " ".join(text.split()[:8])[:60] or "Voice note"
+
+        def _ingest():
+            with self.metrics.timer("ingest_synced"):
+                return self.ingestor.ingest_document(
+                    "note", title, text, source="phone",
+                    source_meta={"speaker": speaker,
+                                 "captured_at": msg.get("timestamp"),
+                                 "device_memory_id": msg.get("id")})
+        memory_id = await anyio.to_thread.run_sync(_ingest)
+        self.metrics.incr("synced_memories")
+        log.info("synced memory from phone [%s] %r", memory_id, text[:80])
+        await self.broadcast("memory_added", {"memory_id": memory_id})
+        return memory_id
+
     async def flush_audio(self, device_id: str, min_bytes: int = 1,
                          privacy_tag: str | None = None):
         """Transcribe the device's buffered PCM16 audio via the ASR workers.
@@ -562,6 +585,111 @@ app = FastAPI(title="Recall PC Hub", version="2.0", lifespan=lifespan)
 
 
 # ------------------------------------------------------------------ REST
+
+# ---------------------------------------------------------------- extension wiring
+
+class InjectRequest(BaseModel):
+    text: str
+
+class InjectResponse(BaseModel):
+    ok: bool
+    memory_id: str | None = None
+
+@app.get("/state")
+async def state_ep():
+    """Extension calls GET /state to test connectivity."""
+    s = get_state()
+    return {"ok": True, "led": s.led_state, "backend": s.backend.name}
+
+@app.post("/demo/inject", response_model=InjectResponse)
+async def demo_inject(body: InjectRequest):
+    """Extension calls POST /demo/inject with {text} to store a memory."""
+    s = get_state()
+    def _ingest():
+        return s.ingestor.ingest_document(
+            source_type="note",
+            title=body.text[:60],
+            content=body.text,
+            source="chrome_extension",
+        )
+    memory_id = await anyio.to_thread.run_sync(_ingest)
+    return InjectResponse(ok=True, memory_id=memory_id)
+
+
+class IngestImageRequest(BaseModel):
+    # base64-encoded PNG/JPEG data URL ("data:image/png;base64,…") or raw base64
+    image: str
+    title: str | None = None
+    source_url: str | None = None
+    source_title: str | None = None
+
+class IngestImageResponse(BaseModel):
+    ok: bool
+    memory_id: str | None = None
+    description: str | None = None
+    error: str | None = None
+
+@app.post("/ingest/image", response_model=IngestImageResponse)
+async def ingest_image_ep(body: IngestImageRequest):
+    """
+    Accepts a screenshot (base64 PNG/JPEG, with or without the data-URL prefix)
+    from the Chrome extension, describes it with the vision-capable LLM backend,
+    then stores the description as a Recall memory.
+    """
+    s = get_state()
+
+    # Strip the data-URL prefix if present so we have raw base64
+    raw_b64 = body.image
+    if "," in raw_b64:
+        raw_b64 = raw_b64.split(",", 1)[1]
+
+    img_bytes = base64.b64decode(raw_b64)
+    title = body.title or "Screenshot"
+    source_meta: dict = {}
+    if body.source_url:
+        source_meta["url"] = body.source_url
+    if body.source_title:
+        source_meta["page_title"] = body.source_title
+
+    def _describe_and_ingest():
+        # Ask the active backend to describe the image; fall back to a stub
+        # when the backend has no vision support (hash / offline modes).
+        description: str | None = None
+        try:
+            if hasattr(s.backend, "describe_image"):
+                description = s.backend.describe_image(img_bytes)
+        except Exception as exc:
+            log.warning("backend.describe_image failed: %s", exc)
+
+        if not description:
+            # Minimal fallback: record that we got an image so it is at least
+            # stored with whatever metadata the extension supplied.
+            description = (
+                f"[Screenshot from {body.source_url or 'unknown page'}] "
+                "(visual content — vision model unavailable)"
+            )
+
+        content = description
+        if body.source_url:
+            content += f"\n\n— from \"{body.source_title or ''}\" ({body.source_url})"
+
+        memory_id = s.ingestor.ingest_document(
+            source_type="image",
+            title=title,
+            content=content,
+            source_meta=source_meta,
+            source="chrome_extension",
+        )
+        return memory_id, description
+
+    try:
+        memory_id, description = await anyio.to_thread.run_sync(_describe_and_ingest)
+        return IngestImageResponse(ok=True, memory_id=memory_id, description=description)
+    except Exception as exc:
+        log.error("ingest_image failed: %s", exc)
+        return IngestImageResponse(ok=False, error=str(exc))
+
+
 
 @app.get("/health", response_model=HealthResponse)
 async def health():
@@ -986,6 +1114,17 @@ async def ws_endpoint(ws: WebSocket):
 
             msg = json.loads(frame.get("text") or "{}")
             mtype = msg.get("type")
+
+            # ---- memory sync from the phone app ----
+            # SyncedMemory (Flutter) streams its outbox rows as bare
+            # {id, timestamp, speaker, text} — no hello handshake — and clears
+            # each row when it gets {"type":"ack","id":..}. Recognise it by
+            # shape, store it, and ack by id so the outbox drains.
+            if mtype in (None, "memory") and "id" in msg and "text" in msg:
+                if (msg.get("text") or "").strip():
+                    await s.sync_memory(msg)
+                await ws.send_text(json.dumps({"type": "ack", "id": msg["id"]}))
+                continue
 
             if mtype == "hello":
                 device_id = msg["device_id"]

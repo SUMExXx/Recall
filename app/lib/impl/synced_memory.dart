@@ -16,6 +16,10 @@ import '../pipeline/vector_store.dart';
 /// socket (re)connects. Reads (recent/search) are served locally, so the app
 /// works fully offline; the PC just receives a copy.
 class SyncedMemory implements VectorStore {
+  /// PC hub to sync to on first run (before the user sets one in the dialog).
+  /// Hardcoded to the event PC's LAN IP; the hub serves the sync socket at /ws.
+  static const String _defaultServerUrl = 'ws://10.20.3.196:8000/ws';
+
   final VectorStore _local;
   final Database _db;
 
@@ -26,6 +30,8 @@ class SyncedMemory implements VectorStore {
   String? _serverUrl;
   int _backoffMs = 1000;
   bool _disposed = false;
+  bool _connected = false;
+  String _lastStatus = ''; // replayed to late subscribers (models load slowly)
 
   SyncedMemory._(this._local, this._db);
 
@@ -51,7 +57,15 @@ class SyncedMemory implements VectorStore {
   /// Live sync status for the UI ("connected", "disconnected", "3 pending", …).
   Stream<String> get status => _status.stream;
 
+  /// The latest status right now — used to seed the UI, since [status] is a
+  /// broadcast stream and its early events fire before the UI subscribes.
+  String get statusNow => _lastStatus;
+
   String? get serverUrl => _serverUrl;
+
+  /// Whether the sync socket is currently connected to the PC hub. The
+  /// inference router uses this to decide PC vs on-device answering.
+  bool get isConnected => _connected;
 
   /// Sets (and persists) the PC hub URL, e.g. `ws://192.168.1.20:8765`, and
   /// (re)connects. Pass an empty string to disable sync.
@@ -91,6 +105,17 @@ class SyncedMemory implements VectorStore {
   Future<List<Memory>> search(String query, {int topK = 20}) =>
       _local.search(query, topK: topK);
 
+  @override
+  Future<void> delete(List<int> ids) async {
+    await _local.delete(ids);
+    if (ids.isEmpty) return;
+    // Drop any not-yet-synced copies so deleted memories aren't sent to the PC.
+    // ponytail: deletes only propagate to the PC for un-synced rows; add a
+    // "delete" sync message if already-synced memories must be removed there too.
+    final placeholders = List.filled(ids.length, '?').join(',');
+    await _db.delete('outbox', where: 'id IN ($placeholders)', whereArgs: ids);
+  }
+
   // --- sync internals ---
 
   void _connect() {
@@ -107,6 +132,7 @@ class SyncedMemory implements VectorStore {
       );
       channel.ready.then((_) {
         _backoffMs = 1000;
+        _connected = true;
         _emit('connected');
         _flush();
       }).catchError((_) {
@@ -163,6 +189,7 @@ class SyncedMemory implements VectorStore {
   }
 
   Future<void> _closeSocket() async {
+    _connected = false;
     _reconnect?.cancel();
     await _sub?.cancel();
     _sub = null;
@@ -172,10 +199,13 @@ class SyncedMemory implements VectorStore {
 
   Future<String?> _loadUrl() async {
     final rows = await _db.query('settings', where: 'key = ?', whereArgs: ['url']);
-    return rows.isEmpty ? null : rows.first['value'] as String?;
+    // No stored setting = true first run → use the hardcoded PC. Once the user
+    // saves a URL (even an empty one to disable sync), that row wins instead.
+    return rows.isEmpty ? _defaultServerUrl : rows.first['value'] as String?;
   }
 
   void _emit(String s) {
+    _lastStatus = s;
     if (!_disposed) _status.add(s);
   }
 

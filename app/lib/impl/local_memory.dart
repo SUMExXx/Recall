@@ -64,6 +64,13 @@ class LocalMemory implements VectorStore {
     return scored.take(topK).map((e) => _toMemory(e.$2)).toList();
   }
 
+  @override
+  Future<void> delete(List<int> ids) async {
+    if (ids.isEmpty) return;
+    final placeholders = List.filled(ids.length, '?').join(',');
+    await _db.delete('memories', where: 'id IN ($placeholders)', whereArgs: ids);
+  }
+
   static Memory _toMemory(Map<String, Object?> r) => Memory(
         id: r['id'] as int,
         timestamp: DateTime.fromMillisecondsSinceEpoch(r['timestamp'] as int),
