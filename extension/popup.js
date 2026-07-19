@@ -1,8 +1,9 @@
-const statusDot = document.getElementById("status-dot");
+const statusDot  = document.getElementById("status-dot");
+const ledLabel   = document.getElementById("led-label");
 const statusText = document.getElementById("status-text");
-const hubUrlEl = document.getElementById("hub-url");
+const hubUrlEl   = document.getElementById("hub-url");
 const manualText = document.getElementById("manual-text");
-const saveBtn = document.getElementById("save-btn");
+const saveBtn    = document.getElementById("save-btn");
 const saveStatus = document.getElementById("save-status");
 const featureStatus = document.getElementById("feature-status");
 
@@ -10,9 +11,21 @@ function send(msg) {
   return new Promise((resolve) => chrome.runtime.sendMessage(msg, resolve));
 }
 
-function setFeatureStatus(msg, isError = false) {
+function setLed(state) {
+  // states: checking | ok | error
+  statusDot.className = "led " + state;
+  ledLabel.textContent = state === "ok" ? "live" : state === "error" ? "offline" : "…";
+}
+
+function setConnectionStatus(ok, text) {
+  setLed(ok ? "ok" : "error");
+  statusText.textContent = text;
+  statusText.className = "status-bar " + (ok ? "ok" : "err");
+}
+
+function setFeatureStatus(msg, type = "") {
   featureStatus.textContent = msg;
-  featureStatus.style.color = isError ? "#dc2626" : "#16a34a";
+  featureStatus.className = "feature-status " + type;
 }
 
 async function getActiveTab() {
@@ -20,39 +33,32 @@ async function getActiveTab() {
   return tab;
 }
 
-// ---- connection status ---------------------------------------------------
+// ── connection status ─────────────────────────────────────────────────────────
 async function refreshStatus() {
+  setLed("checking");
+  statusText.textContent = "checking hub…";
+  statusText.className = "status-bar";
+
   const { hubUrl } = await send({ type: "GET_HUB_URL" });
   hubUrlEl.textContent = hubUrl || "";
+
   const res = await send({ type: "TEST_CONNECTION" });
   if (res?.ok) {
-    statusDot.className = "dot dot-ok";
-    statusText.textContent = "Connected to the Recall hub.";
+    setConnectionStatus(true, "connected · " + (hubUrl || "localhost:8000"));
   } else {
-    statusDot.className = "dot dot-error";
-    statusText.textContent = "Can't reach the hub — check Settings.";
+    setConnectionStatus(false, "hub unreachable — check settings");
   }
 }
 
-// ---- Screenshot → Memory -------------------------------------------------
-// The popup window is short-lived and Chrome can tear it down mid-flight
-// (e.g. once captureVisibleTab shifts focus), which used to leave this
-// awaiting a response that never rendered — the popup just sat there.
-// Fix: grab the tab id, hand the whole flow to background.js, and close
-// immediately. Capture, content-script injection, and opening the
-// selection dialog all now happen in the background, decoupled from
-// whether this popup document is even still alive.
+// ── Screenshot → Memory ───────────────────────────────────────────────────────
 document.getElementById("btn-screenshot").addEventListener("click", async () => {
   const tab = await getActiveTab();
-  if (!tab?.id) { setFeatureStatus("Could not find the active tab.", true); return; }
+  if (!tab?.id) { setFeatureStatus("couldn't find the active tab", "err"); return; }
   chrome.runtime.sendMessage({ type: "START_SCREENSHOT_FLOW", tabId: tab.id });
   window.close();
 });
 
-// ---- Save this PDF -------------------------------------------------------
-// Extracts the PDF text, then hands it to the content script to show in an
-// in-page review popup — nothing is sent to the hub until the user reviews
-// (and optionally edits) the text there and clicks Save.
+// ── Save PDF ──────────────────────────────────────────────────────────────────
 document.getElementById("btn-save-pdf").addEventListener("click", async () => {
   const tab = await getActiveTab();
   const url = tab?.url || "";
@@ -61,11 +67,11 @@ document.getElementById("btn-save-pdf").addEventListener("click", async () => {
     tab?.title?.toLowerCase().includes(".pdf");
 
   if (!isPdf) {
-    setFeatureStatus("Current tab doesn't look like a PDF.", true);
+    setFeatureStatus("current tab doesn't look like a PDF", "err");
     return;
   }
 
-  setFeatureStatus("Extracting PDF text…");
+  setFeatureStatus("extracting PDF text…");
 
   const result = await send({
     type: "EXTRACT_PDF",
@@ -73,47 +79,25 @@ document.getElementById("btn-save-pdf").addEventListener("click", async () => {
   });
 
   if (!result?.ok) {
-    setFeatureStatus("PDF failed: " + (result?.error || "unknown"), true);
+    setFeatureStatus("PDF failed: " + (result?.error || "unknown"), "err");
     return;
   }
 
-  // Open the review popup on the page itself, pre-filled with the
-  // extracted text, so the user can see exactly what's about to be sent.
   chrome.tabs.sendMessage(tab.id, {
     type: "OPEN_PDF_PREVIEW",
     text: result.text,
     tab: { title: tab.title, url },
   }, () => {
     if (chrome.runtime.lastError) {
-      setFeatureStatus("Extracted, but couldn't open the review popup — reload the tab and try again.", true);
+      setFeatureStatus("extracted, but review popup failed — reload tab", "err");
     } else {
-      setFeatureStatus("Review the extracted text on the page →");
-      window.close(); // close the toolbar popup so the review popup is visible
+      setFeatureStatus("review the extracted text on the page →", "ok");
+      window.close();
     }
   });
 });
 
-// ---- Manual text save ----------------------------------------------------
-saveBtn.addEventListener("click", async () => {
-  const text = manualText.value.trim();
-  if (!text) return;
-  saveBtn.disabled = true;
-  saveBtn.textContent = "Saving…";
-  saveStatus.textContent = "";
-  const res = await send({ type: "SAVE_MEMORY", text, withSource: false });
-  if (res?.ok) {
-    saveStatus.textContent = "Saved ✓";
-    saveStatus.style.color = "#16a34a";
-    manualText.value = "";
-  } else {
-    saveStatus.textContent = "Failed — " + (res?.error || "unknown error");
-    saveStatus.style.color = "#dc2626";
-  }
-  saveBtn.disabled = false;
-  saveBtn.textContent = "Save memory";
-});
-
-// ---- Save GitHub repo ------------------------------------------------------
+// ── GitHub repo ───────────────────────────────────────────────────────────────
 document.getElementById("btn-save-github").addEventListener("click", async () => {
   const tab = await getActiveTab();
   const url = tab?.url || "";
@@ -125,17 +109,39 @@ document.getElementById("btn-save-github").addEventListener("click", async () =>
   } catch { /* not a valid URL */ }
 
   if (!isRepoPage) {
-    setFeatureStatus("Open a GitHub repo page first.", true);
+    setFeatureStatus("open a GitHub repo page first", "err");
     return;
   }
 
   chrome.tabs.sendMessage(tab.id, { type: "OPEN_GITHUB_INGEST" }, (res) => {
     if (chrome.runtime.lastError) {
-      setFeatureStatus("Reload the GitHub tab and try again.", true);
+      setFeatureStatus("reload the GitHub tab and try again", "err");
     } else {
-      window.close(); // close popup so the ingest dialog is visible
+      window.close();
     }
   });
+});
+
+// ── manual text save ──────────────────────────────────────────────────────────
+saveBtn.addEventListener("click", async () => {
+  const text = manualText.value.trim();
+  if (!text) return;
+  saveBtn.disabled = true;
+  saveBtn.textContent = "saving…";
+  saveStatus.textContent = "";
+  saveStatus.className = "save-status";
+
+  const res = await send({ type: "SAVE_MEMORY", text, withSource: false });
+  if (res?.ok) {
+    saveStatus.textContent = "saved to memory ✓";
+    saveStatus.className = "save-status ok";
+    manualText.value = "";
+  } else {
+    saveStatus.textContent = "failed — " + (res?.error || "unknown error");
+    saveStatus.className = "save-status err";
+  }
+  saveBtn.disabled = false;
+  saveBtn.textContent = "→ save to memory";
 });
 
 document.getElementById("open-options").addEventListener("click", (e) => {

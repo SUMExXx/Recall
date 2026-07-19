@@ -27,6 +27,22 @@ async function saveMemory(text) {
   return res.json();
 }
 
+async function saveImageMemory(imageDataUrl, tab) {
+  const hubUrl = await getHubUrl();
+  const res = await fetch(`${hubUrl}/ingest/image`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      image: imageDataUrl,
+      title: tab?.title ? `Screenshot — ${tab.title}` : "Screenshot",
+      source_url: tab?.url || "",
+      source_title: tab?.title || "",
+    }),
+  });
+  if (!res.ok) throw new Error(`Hub returned ${res.status}`);
+  return res.json();
+}
+
 async function testConnection() {
   const hubUrl = await getHubUrl();
   const res = await fetch(`${hubUrl}/state`);
@@ -439,7 +455,20 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           break;
         }
 
-        // --- popup-safe screenshot flow: capture + open the selection
+        // --- new: send the raw cropped screenshot image directly to the
+        // hub's /ingest/image endpoint — no local OCR needed ---
+        case "SAVE_SCREENSHOT_IMAGE": {
+          const tab = sender.tab || msg.tab;
+          try {
+            const result = await saveImageMemory(msg.imageDataUrl, tab);
+            sendResponse({ ok: result.ok, description: result.description, error: result.error });
+          } catch (err) {
+            sendResponse({ ok: false, error: String(err.message || err) });
+          }
+          break;
+        }
+
+
         // dialog all happen here, decoupled from the popup's lifetime ---
         case "START_SCREENSHOT_FLOW": {
           handleScreenshotFlow(msg.tabId); // don't await — popup already closed

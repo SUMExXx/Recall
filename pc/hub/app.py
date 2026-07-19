@@ -545,6 +545,111 @@ app = FastAPI(title="Recall PC Hub", version="2.0", lifespan=lifespan)
 
 # ------------------------------------------------------------------ REST
 
+# ---------------------------------------------------------------- extension wiring
+
+class InjectRequest(BaseModel):
+    text: str
+
+class InjectResponse(BaseModel):
+    ok: bool
+    memory_id: str | None = None
+
+@app.get("/state")
+async def state_ep():
+    """Extension calls GET /state to test connectivity."""
+    s = get_state()
+    return {"ok": True, "led": s.led_state, "backend": s.backend.name}
+
+@app.post("/demo/inject", response_model=InjectResponse)
+async def demo_inject(body: InjectRequest):
+    """Extension calls POST /demo/inject with {text} to store a memory."""
+    s = get_state()
+    def _ingest():
+        return s.ingestor.ingest_document(
+            source_type="note",
+            title=body.text[:60],
+            content=body.text,
+            source="chrome_extension",
+        )
+    memory_id = await anyio.to_thread.run_sync(_ingest)
+    return InjectResponse(ok=True, memory_id=memory_id)
+
+
+class IngestImageRequest(BaseModel):
+    # base64-encoded PNG/JPEG data URL ("data:image/png;base64,…") or raw base64
+    image: str
+    title: str | None = None
+    source_url: str | None = None
+    source_title: str | None = None
+
+class IngestImageResponse(BaseModel):
+    ok: bool
+    memory_id: str | None = None
+    description: str | None = None
+    error: str | None = None
+
+@app.post("/ingest/image", response_model=IngestImageResponse)
+async def ingest_image_ep(body: IngestImageRequest):
+    """
+    Accepts a screenshot (base64 PNG/JPEG, with or without the data-URL prefix)
+    from the Chrome extension, describes it with the vision-capable LLM backend,
+    then stores the description as a Recall memory.
+    """
+    s = get_state()
+
+    # Strip the data-URL prefix if present so we have raw base64
+    raw_b64 = body.image
+    if "," in raw_b64:
+        raw_b64 = raw_b64.split(",", 1)[1]
+
+    img_bytes = base64.b64decode(raw_b64)
+    title = body.title or "Screenshot"
+    source_meta: dict = {}
+    if body.source_url:
+        source_meta["url"] = body.source_url
+    if body.source_title:
+        source_meta["page_title"] = body.source_title
+
+    def _describe_and_ingest():
+        # Ask the active backend to describe the image; fall back to a stub
+        # when the backend has no vision support (hash / offline modes).
+        description: str | None = None
+        try:
+            if hasattr(s.backend, "describe_image"):
+                description = s.backend.describe_image(img_bytes)
+        except Exception as exc:
+            log.warning("backend.describe_image failed: %s", exc)
+
+        if not description:
+            # Minimal fallback: record that we got an image so it is at least
+            # stored with whatever metadata the extension supplied.
+            description = (
+                f"[Screenshot from {body.source_url or 'unknown page'}] "
+                "(visual content — vision model unavailable)"
+            )
+
+        content = description
+        if body.source_url:
+            content += f"\n\n— from \"{body.source_title or ''}\" ({body.source_url})"
+
+        memory_id = s.ingestor.ingest_document(
+            source_type="image",
+            title=title,
+            content=content,
+            source_meta=source_meta,
+            source="chrome_extension",
+        )
+        return memory_id, description
+
+    try:
+        memory_id, description = await anyio.to_thread.run_sync(_describe_and_ingest)
+        return IngestImageResponse(ok=True, memory_id=memory_id, description=description)
+    except Exception as exc:
+        log.error("ingest_image failed: %s", exc)
+        return IngestImageResponse(ok=False, error=str(exc))
+
+
+
 @app.get("/health", response_model=HealthResponse)
 async def health():
     s = get_state()
