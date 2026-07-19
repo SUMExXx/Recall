@@ -395,6 +395,24 @@ def test_ws_meeting_lifecycle(client, state):
     assert json.loads(row["source_meta"])["meeting_id"] == mid
 
 
+def test_ws_memory_sync_from_phone(client, state):
+    """The phone app connects with NO hello and streams its outbox rows; the
+    hub stores each as a memory and acks by id so the app clears its outbox."""
+    with client.websocket_connect("/ws") as ws:
+        ws.send_text(json.dumps({
+            "id": 42,
+            "timestamp": "2026-07-19T10:00:00Z",
+            "speaker": "Me",
+            "text": "remember to renew the car insurance in August",
+        }))
+        ack = json.loads(ws.receive_text())
+        while ack.get("type") != "ack":
+            ack = json.loads(ws.receive_text())
+        assert ack["id"] == 42
+
+    assert state.store.stats()["memories"] == 1
+
+
 def test_ws_forget_button(client, state):
     with client.websocket_connect("/ws") as ws:
         ws.send_text(json.dumps({"type": "hello", "device_id": "unoq-2",

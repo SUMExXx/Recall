@@ -314,6 +314,29 @@ class HubState:
             await asyncio.sleep(0)
             await self.set_led("capturing")
 
+    async def sync_memory(self, msg: dict) -> str:
+        """Persist a memory synced from the phone app's outbox
+        (`{id, timestamp, speaker, text}`). Each phone memory is already a
+        complete note, so it goes straight to the store as a document (not the
+        meeting/session path). Heavy embed+ingest runs off the event loop.
+        Returns the hub memory_id."""
+        text = (msg.get("text") or "").strip()
+        speaker = msg.get("speaker") or ""
+        title = " ".join(text.split()[:8])[:60] or "Voice note"
+
+        def _ingest():
+            with self.metrics.timer("ingest_synced"):
+                return self.ingestor.ingest_document(
+                    "note", title, text, source="phone",
+                    source_meta={"speaker": speaker,
+                                 "captured_at": msg.get("timestamp"),
+                                 "device_memory_id": msg.get("id")})
+        memory_id = await anyio.to_thread.run_sync(_ingest)
+        self.metrics.incr("synced_memories")
+        log.info("synced memory from phone [%s] %r", memory_id, text[:80])
+        await self.broadcast("memory_added", {"memory_id": memory_id})
+        return memory_id
+
     async def flush_audio(self, device_id: str, min_bytes: int = 1,
                          privacy_tag: str | None = None):
         """Transcribe the device's buffered PCM16 audio via the ASR workers.
@@ -973,6 +996,17 @@ async def ws_endpoint(ws: WebSocket):
 
             msg = json.loads(frame.get("text") or "{}")
             mtype = msg.get("type")
+
+            # ---- memory sync from the phone app ----
+            # SyncedMemory (Flutter) streams its outbox rows as bare
+            # {id, timestamp, speaker, text} — no hello handshake — and clears
+            # each row when it gets {"type":"ack","id":..}. Recognise it by
+            # shape, store it, and ack by id so the outbox drains.
+            if mtype in (None, "memory") and "id" in msg and "text" in msg:
+                if (msg.get("text") or "").strip():
+                    await s.sync_memory(msg)
+                await ws.send_text(json.dumps({"type": "ack", "id": msg["id"]}))
+                continue
 
             if mtype == "hello":
                 device_id = msg["device_id"]

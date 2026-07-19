@@ -1,11 +1,14 @@
 import 'dart:async';
+import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 
+import 'util/answer_format.dart';
 import 'util/audio_util.dart';
 import 'chat_store.dart';
 import 'memory_pipeline.dart';
 import 'pipeline/vector_store.dart';
+import 'theme.dart';
 import 'widgets/listening_orb.dart';
 
 class HomePage extends StatefulWidget {
@@ -15,18 +18,17 @@ class HomePage extends StatefulWidget {
   State<HomePage> createState() => _HomePageState();
 }
 
-class _HomePageState extends State<HomePage>
-    with SingleTickerProviderStateMixin {
+class _HomePageState extends State<HomePage> {
   MemoryPipeline? _pipe;
   String? _initError;
 
-  late final TabController _tabs = TabController(length: 2, vsync: this)
-    ..addListener(() => setState(() {}));
+  int _tab = 0; // 0 = Memories, 1 = Ask
 
   final _queryController = TextEditingController();
   final _nameController = TextEditingController(text: 'Me');
   final _askController = TextEditingController();
   final List<Memory> _memories = [];
+  final Set<int> _selected = {}; // memory ids selected for deletion
   StreamSubscription<String>? _statusSub;
   StreamSubscription<Memory>? _memorySub;
 
@@ -49,6 +51,13 @@ class _HomePageState extends State<HomePage>
   final List<ChatMessage> _messages = [];
   final _chatScroll = ScrollController();
 
+  // Voice-ask (mic button in the Ask tab): push-to-talk recording → Sarvam STT.
+  StreamSubscription<String>? _questionSub; // wake-word questions in ask mode
+  StreamSubscription<Uint8List>? _voiceSub;
+  final List<double> _voiceBuf = [];
+  bool _voiceAsking = false;
+  bool _voiceWasCapturing = false;
+
   @override
   void initState() {
     super.initState();
@@ -62,6 +71,9 @@ class _HomePageState extends State<HomePage>
       _memorySub = pipe.onMemory.listen((_) => _refresh());
       _syncSub = pipe.syncStatus.listen((s) => setState(() => _syncStatus = s));
       _wakeSub = pipe.listening.listen((v) => setState(() => _listening = v));
+      // Wake-word question while on the Ask tab → answer it (chat + speech).
+      _questionSub = pipe.spokenQuestions
+          .listen((q) => _askQuestion(prefilled: q));
       _pipe = pipe;
       _chat = await ChatStore.create();
       final history = await _chat!.history();
@@ -69,6 +81,7 @@ class _HomePageState extends State<HomePage>
       final speakers = await pipe.enrolledSpeakers();
       setState(() {
         _status = 'Idle';
+        _syncStatus = pipe.syncStatusNow; // seed: early sync events already fired
         _wakeEnabled = pipe.wakeWordEnabled;
         _needsSetup = speakers.isEmpty; // first run → recognize + add the user
         _showWakeIntro = speakers.isEmpty; // first run → explain the wake word
@@ -115,6 +128,35 @@ class _HomePageState extends State<HomePage>
         ..clear()
         ..addAll(items);
     });
+  }
+
+  void _toggleSelect(int id) {
+    setState(() {
+      if (!_selected.remove(id)) _selected.add(id);
+    });
+  }
+
+  Future<void> _deleteSelected() async {
+    final n = _selected.length;
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text('Delete $n ${n == 1 ? 'memory' : 'memories'}?'),
+        content: const Text('This cannot be undone.'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Cancel')),
+          FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Delete')),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    final ids = _selected.toList();
+    await _pipe!.deleteMemories(ids);
+    setState(() {
+      _memories.removeWhere((m) => _selected.contains(m.id));
+      _selected.clear();
+    });
+    _toast('Deleted $n ${n == 1 ? 'memory' : 'memories'}');
   }
 
   /// The FAB toggles a manual "save everything" session. Ending it leaves the
@@ -194,11 +236,13 @@ class _HomePageState extends State<HomePage>
     });
   }
 
-  Future<void> _askQuestion() async {
-    final q = _askController.text.trim();
+  /// Asks [prefilled] (from voice) or the text field, shows it in chat, and
+  /// speaks the answer via Sarvam TTS.
+  Future<void> _askQuestion({String? prefilled}) async {
+    final q = (prefilled ?? _askController.text).trim();
     if (q.isEmpty || _asking) return;
     FocusScope.of(context).unfocus();
-    _askController.clear();
+    if (prefilled == null) _askController.clear();
 
     final userMsg = await _chat!.add(ChatMessage(
       timestamp: DateTime.now(),
@@ -211,24 +255,79 @@ class _HomePageState extends State<HomePage>
     });
     _scrollToBottom();
 
-    String answer;
+    String raw;
     try {
-      answer = await _pipe!.ask(q);
+      raw = await _pipe!.ask(q);
     } catch (e) {
-      answer = 'Error: $e';
+      raw = 'Error: $e';
     }
     if (!mounted) return;
+
+    // Separate the answer from its memory citation: speak/show the answer,
+    // box the reference below it.
+    final isError = raw.startsWith('Error:');
+    final (answer, reference) = isError ? (raw, null) : splitAnswer(raw);
 
     final botMsg = await _chat!.add(ChatMessage(
       timestamp: DateTime.now(),
       fromUser: false,
       text: answer,
+      reference: reference,
     ));
     setState(() {
       _messages.add(botMsg);
       _asking = false;
     });
     _scrollToBottom();
+
+    // Voice only the answer (never the citation); best-effort, never blocks.
+    if (!isError) {
+      unawaited(_pipe!.speak(answer).catchError((_) {}));
+    }
+  }
+
+  /// Mic button in Ask: tap to start recording, tap again to transcribe
+  /// (Sarvam STT) and ask. Releases the wake-word mic while recording.
+  Future<void> _toggleVoiceAsk() async {
+    if (_voiceAsking) {
+      await _voiceSub?.cancel();
+      _voiceSub = null;
+      setState(() => _voiceAsking = false);
+      final samples = Float32List.fromList(_voiceBuf);
+      _voiceBuf.clear();
+      if (_voiceWasCapturing) await _syncMic(); // restore background listening
+      if (samples.isEmpty) return;
+      setState(() => _asking = true); // show progress while transcribing
+      String q;
+      try {
+        q = await _pipe!.transcribeQuestion(samples);
+      } catch (e) {
+        setState(() => _asking = false);
+        _toast('Transcription failed');
+        return;
+      }
+      setState(() => _asking = false);
+      if (q.isEmpty) {
+        _toast('Didn’t catch that');
+        return;
+      }
+      await _askQuestion(prefilled: q);
+      return;
+    }
+
+    // Start recording — the mic can't be shared, so pause wake-word capture.
+    if (!await ensureMicPermission()) {
+      _toast('Microphone permission denied');
+      return;
+    }
+    _voiceWasCapturing = _capturing;
+    if (_capturing) {
+      await _pipe!.stop();
+      setState(() => _capturing = false);
+    }
+    _voiceBuf.clear();
+    _voiceSub = micStream().listen((b) => _voiceBuf.addAll(pcm16ToFloat32(b)));
+    setState(() => _voiceAsking = true);
   }
 
   void _scrollToBottom() {
@@ -259,7 +358,7 @@ class _HomePageState extends State<HomePage>
           keyboardType: TextInputType.url,
           decoration: const InputDecoration(
             labelText: 'PC WebSocket URL',
-            hintText: 'ws://192.168.1.20:8765',
+            hintText: 'ws://10.20.3.196:8000/ws',
             helperText: 'Empty disables sync. Unsent memories flush on connect.',
           ),
         ),
@@ -409,14 +508,28 @@ class _HomePageState extends State<HomePage>
     _memorySub?.cancel();
     _syncSub?.cancel();
     _wakeSub?.cancel();
+    _questionSub?.cancel();
+    _voiceSub?.cancel();
     _queryController.dispose();
     _nameController.dispose();
     _askController.dispose();
     _chatScroll.dispose();
-    _tabs.dispose();
     _chat?.dispose();
     _pipe?.dispose();
     super.dispose();
+  }
+
+  // ==================== presentation ====================
+
+  /// Connected to the PC hub: actively linked, whether idle or flushing.
+  bool get _pcConnected =>
+      _syncStatus == 'connected' ||
+      _syncStatus == 'synced' ||
+      _syncStatus.endsWith('pending');
+
+  void _setTab(int i) {
+    setState(() => _tab = i);
+    _pipe?.setAskMode(i == 1); // wake-word captures become questions in Ask
   }
 
   @override
@@ -424,90 +537,193 @@ class _HomePageState extends State<HomePage>
     if (_pipe != null && !_needsSetup && !_showWakeIntro) return _buildReady();
 
     return Scaffold(
-      appBar: AppBar(title: const Text('Recall')),
-      body: _initError != null
-          ? Center(
-              child: Padding(
-                padding: const EdgeInsets.all(24),
-                child: Text('Failed to start:\n$_initError'),
-              ),
-            )
-          : _pipe == null
-              ? Center(
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      const CircularProgressIndicator(),
-                      const SizedBox(height: 16),
-                      Text(_status),
-                    ],
-                  ),
+      body: _glowBackground(
+        child: Center(
+          child: _initError != null
+              ? Padding(
+                  padding: const EdgeInsets.all(24),
+                  child: Text('Failed to start:\n$_initError',
+                      textAlign: TextAlign.center),
                 )
-              : _needsSetup
-                  ? _buildSetup()
-                  : _buildWakeIntro(),
+              : _pipe == null
+                  ? _buildLoading()
+                  : _needsSetup
+                      ? _buildSetup()
+                      : _buildWakeIntro(),
+        ),
+      ),
     );
   }
 
-  /// Main UI once models are loaded and a speaker is enrolled: two tabs
-  /// (Memories, Ask) plus the global capture Start/Stop button.
+  /// A subtle top radial glow to give the dark-first screens depth.
+  Widget _glowBackground({required Widget child}) {
+    final cs = Theme.of(context).colorScheme;
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        gradient: RadialGradient(
+          center: const Alignment(0, -0.7),
+          radius: 1.2,
+          colors: [
+            cs.primary.withValues(alpha: 0.12),
+            cs.surface,
+          ],
+          stops: const [0.0, 0.7],
+        ),
+      ),
+      child: child,
+    );
+  }
+
+  Widget _buildLoading() {
+    final cs = Theme.of(context).colorScheme;
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        _orbGlyph(96),
+        const SizedBox(height: 28),
+        Text('Recall',
+            style: Theme.of(context).textTheme.headlineSmall?.copyWith(
+                fontWeight: FontWeight.w700, letterSpacing: 0.5)),
+        const SizedBox(height: 20),
+        SizedBox(
+          width: 26,
+          height: 26,
+          child: CircularProgressIndicator(strokeWidth: 2.5, color: cs.primary),
+        ),
+        const SizedBox(height: 16),
+        Text(_status, style: TextStyle(color: cs.onSurfaceVariant)),
+      ],
+    );
+  }
+
+  /// The static, non-animated orb used as a brand glyph on non-ready screens.
+  Widget _orbGlyph(double size) {
+    final cs = Theme.of(context).colorScheme;
+    return Container(
+      width: size,
+      height: size,
+      decoration: BoxDecoration(
+        shape: BoxShape.circle,
+        gradient: RadialGradient(
+          colors: [Colors.white, cs.primary, AppTheme.accent.withValues(alpha: 0.85)],
+          stops: const [0.0, 0.5, 1.0],
+        ),
+        boxShadow: [
+          BoxShadow(color: cs.primary.withValues(alpha: 0.55), blurRadius: 40, spreadRadius: 8),
+          BoxShadow(color: AppTheme.accent.withValues(alpha: 0.3), blurRadius: 60, spreadRadius: 2),
+        ],
+      ),
+    );
+  }
+
+  /// Main UI once models are loaded and a speaker is enrolled.
   Widget _buildReady() {
-    final onMemoriesTab = _tabs.index == 0;
+    final cs = Theme.of(context).colorScheme;
     return Scaffold(
       appBar: AppBar(
-          title: const Text('Recall'),
-          actions: [
-            IconButton(
-              tooltip: _wakeEnabled ? 'Hey Recall: on' : 'Hey Recall: off',
-              onPressed: _toggleWake,
-              icon: Icon(_wakeEnabled ? Icons.hearing : Icons.hearing_disabled),
-            ),
-            IconButton(
-              tooltip: 'PC sync',
-              onPressed: _syncSettings,
-              icon: const Icon(Icons.sync),
-            ),
-            IconButton(
-              tooltip: 'Download LLM model',
-              onPressed: _downloadModel,
-              icon: const Icon(Icons.download),
-            ),
-            IconButton(
-              tooltip: 'Load local model',
-              onPressed: _loadLocalModel,
-              icon: const Icon(Icons.folder_open),
-            ),
-            IconButton(
-              tooltip: 'Enroll speaker',
-              onPressed: _enroll,
-              icon: const Icon(Icons.person_add),
-            ),
-            IconButton(
-              tooltip: 'Clear chat',
-              onPressed: _messages.isEmpty ? null : _clearChat,
-              icon: const Icon(Icons.delete_sweep),
-            ),
-          ],
-        bottom: TabBar(
-          controller: _tabs,
-          tabs: const [
-            Tab(text: 'Memories', icon: Icon(Icons.list)),
-            Tab(text: 'Ask', icon: Icon(Icons.question_answer)),
+        titleSpacing: 16,
+        title: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            _orbGlyph(22),
+            const SizedBox(width: 10),
+            const Text('Recall'),
           ],
         ),
+        actions: [
+          IconButton(
+            tooltip: _wakeEnabled ? '“Hey Recall”: on' : '“Hey Recall”: off',
+            isSelected: _wakeEnabled,
+            onPressed: _toggleWake,
+            icon: const Icon(Icons.hearing_disabled),
+            selectedIcon: Icon(Icons.hearing, color: cs.primary),
+          ),
+          _pcChip(),
+          PopupMenuButton<String>(
+            tooltip: 'More',
+            icon: const Icon(Icons.more_vert),
+            onSelected: (v) {
+              switch (v) {
+                case 'enroll':
+                  _enroll();
+                case 'download':
+                  _downloadModel();
+                case 'local':
+                  _loadLocalModel();
+                case 'clear':
+                  _clearChat();
+              }
+            },
+            itemBuilder: (_) => [
+              const PopupMenuItem(
+                value: 'enroll',
+                child: ListTile(
+                    leading: Icon(Icons.person_add_alt),
+                    title: Text('Enroll speaker'),
+                    contentPadding: EdgeInsets.zero),
+              ),
+              const PopupMenuItem(
+                value: 'download',
+                child: ListTile(
+                    leading: Icon(Icons.cloud_download_outlined),
+                    title: Text('Download LLM model'),
+                    contentPadding: EdgeInsets.zero),
+              ),
+              const PopupMenuItem(
+                value: 'local',
+                child: ListTile(
+                    leading: Icon(Icons.folder_open_outlined),
+                    title: Text('Load local model'),
+                    contentPadding: EdgeInsets.zero),
+              ),
+              PopupMenuItem(
+                value: 'clear',
+                enabled: _messages.isNotEmpty,
+                child: const ListTile(
+                    leading: Icon(Icons.delete_sweep_outlined),
+                    title: Text('Clear chat'),
+                    contentPadding: EdgeInsets.zero),
+              ),
+            ],
+          ),
+          const SizedBox(width: 4),
+        ],
       ),
       body: Stack(
         children: [
-          TabBarView(
-            controller: _tabs,
-            children: [_buildBody(), _buildAsk()],
+          IndexedStack(
+            index: _tab,
+            children: [_buildMemories(), _buildAsk()],
           ),
-          Positioned.fill(child: ListeningOrb(visible: _listening)),
+          Positioned.fill(
+            child: ListeningOrb(
+              visible: _listening,
+              label: _tab == 1 ? 'Ask me…' : 'Listening…',
+            ),
+          ),
         ],
       ),
-      floatingActionButton: onMemoriesTab
+      bottomNavigationBar: NavigationBar(
+        selectedIndex: _tab,
+        onDestinationSelected: _setTab,
+        destinations: const [
+          NavigationDestination(
+            icon: Icon(Icons.bubble_chart_outlined),
+            selectedIcon: Icon(Icons.bubble_chart),
+            label: 'Memories',
+          ),
+          NavigationDestination(
+            icon: Icon(Icons.forum_outlined),
+            selectedIcon: Icon(Icons.forum),
+            label: 'Ask',
+          ),
+        ],
+      ),
+      floatingActionButton: _tab == 0 && !_listening && _selected.isEmpty
           ? FloatingActionButton.extended(
               onPressed: _toggleCapture,
+              backgroundColor: _manualCapture ? cs.error : cs.primary,
+              foregroundColor: _manualCapture ? cs.onError : cs.onPrimary,
               icon: Icon(_manualCapture ? Icons.stop : Icons.mic),
               label: Text(_manualCapture ? 'Stop' : 'Record'),
             )
@@ -515,36 +731,260 @@ class _HomePageState extends State<HomePage>
     );
   }
 
+  /// AppBar PC-sync chip: colored dot + short state, tap opens sync settings.
+  Widget _pcChip() {
+    final cs = Theme.of(context).colorScheme;
+    final (color, icon, label) = _pcConnected
+        ? (Colors.greenAccent.shade400, Icons.cloud_done, 'PC')
+        : _syncStatus == 'connecting'
+            ? (Colors.orangeAccent, Icons.cloud_sync, '···')
+            : (cs.onSurfaceVariant, Icons.cloud_off, 'off');
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 8),
+      child: Tooltip(
+        message: _syncStatus.isEmpty ? 'PC sync: off' : 'PC: $_syncStatus',
+        child: InkWell(
+          borderRadius: BorderRadius.circular(30),
+          onTap: _syncSettings,
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+            decoration: BoxDecoration(
+              color: cs.surfaceContainerHigh,
+              borderRadius: BorderRadius.circular(30),
+              border: Border.all(color: color.withValues(alpha: 0.5)),
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(icon, size: 16, color: color),
+                const SizedBox(width: 5),
+                Text(label,
+                    style: TextStyle(
+                        fontSize: 12, fontWeight: FontWeight.w600, color: cs.onSurface)),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  // ---------------------------------------------------------- Memories tab
+
+  Widget _buildMemories() {
+    return Column(
+      children: [
+        if (_selected.isNotEmpty) _selectionBar() else _statusBar(),
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 4, 16, 8),
+          child: TextField(
+            controller: _queryController,
+            textInputAction: TextInputAction.search,
+            onSubmitted: (_) => _search(),
+            onChanged: (_) => setState(() {}), // toggles the clear button
+            decoration: InputDecoration(
+              hintText: 'Search memories…',
+              prefixIcon: _searching
+                  ? const Padding(
+                      padding: EdgeInsets.all(12),
+                      child: SizedBox(
+                          width: 18,
+                          height: 18,
+                          child: CircularProgressIndicator(strokeWidth: 2)),
+                    )
+                  : const Icon(Icons.search),
+              suffixIcon: _queryController.text.isEmpty
+                  ? null
+                  : IconButton(
+                      tooltip: 'Clear',
+                      icon: const Icon(Icons.close),
+                      onPressed: () {
+                        _queryController.clear();
+                        setState(() {});
+                        _refresh();
+                      },
+                    ),
+            ),
+          ),
+        ),
+        Expanded(
+          child: _memories.isEmpty
+              ? _emptyState(
+                  icon: Icons.auto_awesome,
+                  title: 'No memories yet',
+                  body: _queryController.text.isEmpty
+                      ? 'Say “Hey Recall” or tap Record to capture your first memory.'
+                      : 'No memories match “${_queryController.text}”.',
+                )
+              : ListView.separated(
+                  padding: const EdgeInsets.fromLTRB(12, 4, 12, 96),
+                  itemCount: _memories.length,
+                  separatorBuilder: (_, __) => const SizedBox(height: 8),
+                  itemBuilder: (_, i) => _memoryCard(_memories[i]),
+                ),
+        ),
+      ],
+    );
+  }
+
+  Widget _statusBar() {
+    final cs = Theme.of(context).colorScheme;
+    final recording = _status.toLowerCase().contains('record');
+    final listening = _status.toLowerCase().contains('listen');
+    final (dot, text) = recording
+        ? (cs.error, 'Recording')
+        : listening
+            ? (Colors.greenAccent.shade400, 'Listening')
+            : (cs.onSurfaceVariant, _status);
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(20, 10, 20, 4),
+      child: Row(
+        children: [
+          Container(width: 9, height: 9, decoration: BoxDecoration(color: dot, shape: BoxShape.circle)),
+          const SizedBox(width: 8),
+          Text(text, style: TextStyle(color: cs.onSurfaceVariant, fontWeight: FontWeight.w500)),
+          const Spacer(),
+          if (_memories.isNotEmpty)
+            Text('${_memories.length} ${_memories.length == 1 ? 'memory' : 'memories'}',
+                style: TextStyle(color: cs.onSurfaceVariant, fontSize: 12)),
+        ],
+      ),
+    );
+  }
+
+  Widget _selectionBar() {
+    final cs = Theme.of(context).colorScheme;
+    return Container(
+      color: cs.primaryContainer,
+      padding: const EdgeInsets.symmetric(horizontal: 4),
+      child: Row(
+        children: [
+          IconButton(
+            tooltip: 'Cancel selection',
+            icon: const Icon(Icons.close),
+            onPressed: () => setState(_selected.clear),
+          ),
+          Text('${_selected.length} selected',
+              style: TextStyle(
+                  color: cs.onPrimaryContainer, fontWeight: FontWeight.w600)),
+          const Spacer(),
+          IconButton(
+            tooltip: 'Delete selected',
+            icon: const Icon(Icons.delete_outline),
+            onPressed: _deleteSelected,
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _memoryCard(Memory m) {
+    final cs = Theme.of(context).colorScheme;
+    final selected = _selected.contains(m.id);
+    final selecting = _selected.isNotEmpty;
+    return Card(
+      color: selected ? cs.primaryContainer : cs.surfaceContainer,
+      child: InkWell(
+        borderRadius: BorderRadius.circular(20),
+        onTap: selecting ? () => _toggleSelect(m.id) : null,
+        onLongPress: () => _toggleSelect(m.id),
+        child: Padding(
+          padding: const EdgeInsets.all(14),
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              selecting
+                  ? Padding(
+                      padding: const EdgeInsets.only(top: 2, right: 2),
+                      child: Icon(
+                        selected ? Icons.check_circle : Icons.circle_outlined,
+                        color: selected ? cs.primary : cs.onSurfaceVariant,
+                      ),
+                    )
+                  : _avatar(m.speaker),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(m.text,
+                        style: const TextStyle(fontSize: 15, height: 1.35)),
+                    const SizedBox(height: 6),
+                    Row(
+                      children: [
+                        Icon(Icons.person_outline, size: 13, color: cs.onSurfaceVariant),
+                        const SizedBox(width: 4),
+                        Text(m.speaker,
+                            style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant)),
+                        Text('  ·  ${_time(m.timestamp)}',
+                            style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant)),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _avatar(String name) {
+    final color = _avatarColor(name);
+    final initial = name.trim().isEmpty ? '?' : name.trim()[0].toUpperCase();
+    return Container(
+      width: 38,
+      height: 38,
+      alignment: Alignment.center,
+      decoration: BoxDecoration(
+        shape: BoxShape.circle,
+        gradient: LinearGradient(
+          colors: [color, Color.lerp(color, Colors.black, 0.25)!],
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+        ),
+      ),
+      child: Text(initial,
+          style: const TextStyle(
+              color: Colors.white, fontWeight: FontWeight.w700, fontSize: 16)),
+    );
+  }
+
+  // ---------------------------------------------------------- Ask tab
+
   Widget _buildAsk() {
+    final cs = Theme.of(context).colorScheme;
     return Column(
       children: [
         Expanded(
           child: _messages.isEmpty && !_asking
-              ? const Center(
-                  child: Padding(
-                    padding: EdgeInsets.all(24),
-                    child: Text(
-                      'Ask a question and Recall will answer from your memories.',
-                      textAlign: TextAlign.center,
-                    ),
-                  ),
+              ? _emptyState(
+                  icon: Icons.forum_outlined,
+                  title: 'Ask Recall anything',
+                  body: 'Ask about your memories by text or voice — I answer '
+                      'from what you’ve saved, and read it back aloud.',
                 )
               : ListView.builder(
                   controller: _chatScroll,
-                  padding: const EdgeInsets.fromLTRB(12, 12, 12, 12),
+                  padding: const EdgeInsets.fromLTRB(14, 14, 14, 14),
                   itemCount: _messages.length + (_asking ? 1 : 0),
                   itemBuilder: (context, i) {
-                    if (i == _messages.length) return _buildTyping();
+                    if (i == _messages.length) return const _TypingBubble();
                     return _buildBubble(_messages[i]);
                   },
                 ),
         ),
-        const Divider(height: 1),
         SafeArea(
           top: false,
-          child: Padding(
-            padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
+          child: Container(
+            decoration: BoxDecoration(
+              color: cs.surfaceContainerLow,
+              border: Border(top: BorderSide(color: cs.outlineVariant)),
+            ),
+            padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
             child: Row(
+              crossAxisAlignment: CrossAxisAlignment.end,
               children: [
                 Expanded(
                   child: TextField(
@@ -555,15 +995,25 @@ class _HomePageState extends State<HomePage>
                     maxLines: 4,
                     decoration: const InputDecoration(
                       hintText: 'Ask about your memories…',
-                      border: OutlineInputBorder(),
-                      isDense: true,
                     ),
                   ),
                 ),
                 const SizedBox(width: 8),
                 IconButton.filled(
+                  tooltip: 'Send',
                   onPressed: _asking ? null : _askQuestion,
-                  icon: const Icon(Icons.send),
+                  icon: const Icon(Icons.arrow_upward),
+                ),
+                const SizedBox(width: 6),
+                IconButton.filled(
+                  tooltip: _voiceAsking ? 'Stop & ask' : 'Ask by voice',
+                  onPressed: _asking ? null : _toggleVoiceAsk,
+                  icon: Icon(_voiceAsking ? Icons.stop : Icons.mic),
+                  style: IconButton.styleFrom(
+                    backgroundColor: _voiceAsking ? cs.error : cs.secondaryContainer,
+                    foregroundColor:
+                        _voiceAsking ? cs.onError : cs.onSecondaryContainer,
+                  ),
                 ),
               ],
             ),
@@ -574,219 +1024,286 @@ class _HomePageState extends State<HomePage>
   }
 
   Widget _buildBubble(ChatMessage m) {
-    final scheme = Theme.of(context).colorScheme;
-    final bg = m.fromUser ? scheme.primary : scheme.surfaceContainerHighest;
-    final fg = m.fromUser ? scheme.onPrimary : scheme.onSurface;
-    return Align(
-      alignment: m.fromUser ? Alignment.centerRight : Alignment.centerLeft,
-      child: Container(
-        margin: const EdgeInsets.symmetric(vertical: 4),
-        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-        constraints: BoxConstraints(
-          maxWidth: MediaQuery.of(context).size.width * 0.78,
-        ),
-        decoration: BoxDecoration(
-          color: bg,
-          borderRadius: BorderRadius.circular(16),
-        ),
-        child: SelectableText(m.text, style: TextStyle(color: fg)),
+    final cs = Theme.of(context).colorScheme;
+    final maxW = MediaQuery.of(context).size.width * 0.80;
+    final ref = m.reference;
+    final userRadius = BorderRadius.circular(18).copyWith(bottomRight: const Radius.circular(4));
+    final botRadius = BorderRadius.circular(18).copyWith(bottomLeft: const Radius.circular(4));
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 5),
+      child: Column(
+        crossAxisAlignment:
+            m.fromUser ? CrossAxisAlignment.end : CrossAxisAlignment.start,
+        children: [
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 15, vertical: 11),
+            constraints: BoxConstraints(maxWidth: maxW),
+            decoration: BoxDecoration(
+              gradient: m.fromUser
+                  ? LinearGradient(
+                      colors: [cs.primary, Color.lerp(cs.primary, AppTheme.accent, 0.45)!],
+                      begin: Alignment.topLeft,
+                      end: Alignment.bottomRight,
+                    )
+                  : null,
+              color: m.fromUser ? null : cs.surfaceContainerHigh,
+              borderRadius: m.fromUser ? userRadius : botRadius,
+            ),
+            child: SelectableText(
+              m.text,
+              style: TextStyle(
+                color: m.fromUser ? cs.onPrimary : cs.onSurface,
+                height: 1.35,
+                fontSize: 15,
+              ),
+            ),
+          ),
+          if (ref != null && ref.isNotEmpty)
+            Container(
+              margin: const EdgeInsets.only(top: 6, left: 4),
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+              constraints: BoxConstraints(maxWidth: maxW),
+              decoration: BoxDecoration(
+                color: cs.surfaceContainerLow,
+                border: Border.all(color: cs.outlineVariant),
+                borderRadius: BorderRadius.circular(10),
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Icon(Icons.bookmark_border, size: 15, color: cs.tertiary),
+                  const SizedBox(width: 7),
+                  Flexible(
+                    child: SelectableText(
+                      ref,
+                      style: Theme.of(context)
+                          .textTheme
+                          .bodySmall
+                          ?.copyWith(color: cs.onSurfaceVariant),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+        ],
       ),
     );
   }
 
-  Widget _buildTyping() {
-    return Align(
-      alignment: Alignment.centerLeft,
-      child: Container(
-        margin: const EdgeInsets.symmetric(vertical: 4),
-        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-        decoration: BoxDecoration(
-          color: Theme.of(context).colorScheme.surfaceContainerHighest,
-          borderRadius: BorderRadius.circular(16),
-        ),
-        child: const SizedBox(
-          width: 20,
-          height: 20,
-          child: CircularProgressIndicator(strokeWidth: 2),
+  Widget _emptyState({
+    required IconData icon,
+    required String title,
+    required String body,
+  }) {
+    final cs = Theme.of(context).colorScheme;
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(32),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Container(
+              width: 84,
+              height: 84,
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                color: cs.primaryContainer.withValues(alpha: 0.4),
+              ),
+              child: Icon(icon, size: 40, color: cs.primary),
+            ),
+            const SizedBox(height: 20),
+            Text(title,
+                style: Theme.of(context)
+                    .textTheme
+                    .titleMedium
+                    ?.copyWith(fontWeight: FontWeight.w700)),
+            const SizedBox(height: 8),
+            Text(body,
+                textAlign: TextAlign.center,
+                style: TextStyle(color: cs.onSurfaceVariant, height: 1.4)),
+          ],
         ),
       ),
     );
   }
+
+  // ---------------------------------------------------------- onboarding
 
   Widget _buildSetup() {
-    return Center(
-      child: SingleChildScrollView(
-        padding: const EdgeInsets.all(24),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            const Icon(Icons.record_voice_over, size: 64),
-            const SizedBox(height: 16),
-            Text(
-              'Set up your voice',
-              style: Theme.of(context).textTheme.headlineSmall,
-              textAlign: TextAlign.center,
-            ),
-            const SizedBox(height: 8),
-            const Text(
-              'Record a few seconds of speech so Recall can recognize you '
-              'and tag your memories with your name.',
-              textAlign: TextAlign.center,
-            ),
-            const SizedBox(height: 24),
-            TextField(
-              controller: _nameController,
-              enabled: !_recording,
-              decoration: const InputDecoration(
-                labelText: 'Your name',
-                border: OutlineInputBorder(),
-              ),
-            ),
-            const SizedBox(height: 16),
-            FilledButton.icon(
-              onPressed: _recording ? null : _setupVoice,
-              icon: _recording
-                  ? const SizedBox(
-                      width: 18,
-                      height: 18,
-                      child: CircularProgressIndicator(strokeWidth: 2),
-                    )
-                  : const Icon(Icons.mic),
-              label: Text(_recording ? 'Recording… keep talking' : 'Record my voice (8s)'),
-            ),
-            TextButton(
-              onPressed: _recording ? null : () => setState(() => _needsSetup = false),
-              child: const Text('Skip for now'),
-            ),
-          ],
-        ),
+    return SingleChildScrollView(
+      padding: const EdgeInsets.all(28),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Center(child: _orbGlyph(84)),
+          const SizedBox(height: 28),
+          Text('Set up your voice',
+              style: Theme.of(context)
+                  .textTheme
+                  .headlineSmall
+                  ?.copyWith(fontWeight: FontWeight.w700),
+              textAlign: TextAlign.center),
+          const SizedBox(height: 10),
+          Text(
+            'Record a few seconds of speech so Recall can recognize you and tag '
+            'your memories with your name.',
+            textAlign: TextAlign.center,
+            style: TextStyle(
+                color: Theme.of(context).colorScheme.onSurfaceVariant, height: 1.4),
+          ),
+          const SizedBox(height: 28),
+          TextField(
+            controller: _nameController,
+            enabled: !_recording,
+            textCapitalization: TextCapitalization.words,
+            decoration: const InputDecoration(labelText: 'Your name'),
+          ),
+          const SizedBox(height: 16),
+          FilledButton.icon(
+            onPressed: _recording ? null : _setupVoice,
+            icon: _recording
+                ? const SizedBox(
+                    width: 18,
+                    height: 18,
+                    child: CircularProgressIndicator(strokeWidth: 2))
+                : const Icon(Icons.mic),
+            label: Text(_recording ? 'Recording… keep talking' : 'Record my voice (8s)'),
+          ),
+          const SizedBox(height: 4),
+          TextButton(
+            onPressed: _recording ? null : () => setState(() => _needsSetup = false),
+            child: const Text('Skip for now'),
+          ),
+        ],
       ),
     );
   }
 
-  /// First-run onboarding for the "Hey Recall" wake word, with a preview orb.
+  /// First-run onboarding for the "Hey Recall" wake word.
   Widget _buildWakeIntro() {
-    final color = Theme.of(context).colorScheme.primary;
-    return Center(
-      child: SingleChildScrollView(
-        padding: const EdgeInsets.all(24),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            Center(
-              child: Container(
-                width: 96,
-                height: 96,
-                decoration: BoxDecoration(
-                  shape: BoxShape.circle,
-                  gradient: RadialGradient(
-                    colors: [Colors.white, color, color.withOpacity(0.55)],
-                    stops: const [0.0, 0.55, 1.0],
-                  ),
-                  boxShadow: [
-                    BoxShadow(
-                      color: color.withOpacity(0.6),
-                      blurRadius: 40,
-                      spreadRadius: 12,
-                    ),
-                  ],
-                ),
-              ),
-            ),
-            const SizedBox(height: 32),
-            Text(
-              'Say “Hey Recall”',
-              style: Theme.of(context).textTheme.headlineSmall,
-              textAlign: TextAlign.center,
-            ),
-            const SizedBox(height: 12),
-            const Text(
-              'Recall listens in the background. Whenever you say '
-              '“Hey Recall”, a glowing orb rises from the bottom and Recall '
-              'saves what you say next to your memories.',
-              textAlign: TextAlign.center,
-            ),
-            const SizedBox(height: 28),
-            FilledButton.icon(
-              onPressed: () => _finishWakeIntro(true),
-              icon: const Icon(Icons.hearing),
-              label: const Text('Enable “Hey Recall”'),
-            ),
-            TextButton(
-              onPressed: () => _finishWakeIntro(false),
-              child: const Text('Not now'),
-            ),
-          ],
-        ),
+    final cs = Theme.of(context).colorScheme;
+    return SingleChildScrollView(
+      padding: const EdgeInsets.all(28),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Center(child: _orbGlyph(100)),
+          const SizedBox(height: 36),
+          Text('Say “Hey Recall”',
+              style: Theme.of(context)
+                  .textTheme
+                  .headlineSmall
+                  ?.copyWith(fontWeight: FontWeight.w700),
+              textAlign: TextAlign.center),
+          const SizedBox(height: 12),
+          Text(
+            'Recall listens in the background. Whenever you say “Hey Recall”, a '
+            'glowing orb rises and Recall saves what you say next to your memories.',
+            textAlign: TextAlign.center,
+            style: TextStyle(color: cs.onSurfaceVariant, height: 1.45),
+          ),
+          const SizedBox(height: 32),
+          FilledButton.icon(
+            onPressed: () => _finishWakeIntro(true),
+            icon: const Icon(Icons.hearing),
+            label: const Text('Enable “Hey Recall”'),
+          ),
+          const SizedBox(height: 4),
+          TextButton(
+            onPressed: () => _finishWakeIntro(false),
+            child: const Text('Not now'),
+          ),
+        ],
       ),
     );
   }
 
-  Widget _buildBody() {
-    return Column(
-      children: [
-        Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-          child: Row(
-            children: [
-              const Icon(Icons.circle, size: 12, color: Colors.grey),
-              const SizedBox(width: 8),
-              Text(_status),
-              const Spacer(),
-              if (_syncStatus.isNotEmpty) ...[
-                const Icon(Icons.sync, size: 14, color: Colors.grey),
-                const SizedBox(width: 4),
-                Text(_syncStatus, style: const TextStyle(color: Colors.grey)),
-              ],
-            ],
-          ),
-        ),
-        Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 16),
-          child: Row(
-            children: [
-              Expanded(
-                child: TextField(
-                  controller: _queryController,
-                  textInputAction: TextInputAction.search,
-                  onSubmitted: (_) => _search(),
-                  decoration: const InputDecoration(
-                    hintText: 'Search memories…',
-                    isDense: true,
-                  ),
-                ),
-              ),
-              IconButton(
-                onPressed: _searching ? null : _search,
-                icon: const Icon(Icons.search),
-              ),
-            ],
-          ),
-        ),
-        const Divider(height: 1),
-        Expanded(
-          child: _memories.isEmpty
-              ? const Center(child: Text('No memories yet'))
-              : ListView.separated(
-                  itemCount: _memories.length,
-                  separatorBuilder: (_, __) => const Divider(height: 1),
-                  itemBuilder: (_, i) {
-                    final m = _memories[i];
-                    return ListTile(
-                      title: Text(m.text),
-                      subtitle: Text('${m.speaker} · ${_time(m.timestamp)}'),
-                    );
-                  },
-                ),
-        ),
-      ],
-    );
+  static Color _avatarColor(String name) {
+    const palette = [
+      Color(0xFF7C5CFF),
+      Color(0xFF22D3EE),
+      Color(0xFFFF6B9D),
+      Color(0xFF4ADE80),
+      Color(0xFFFBBF24),
+      Color(0xFFF97316),
+    ];
+    var h = 7;
+    for (final c in name.codeUnits) {
+      h = (h * 31 + c) & 0x7fffffff;
+    }
+    return palette[h % palette.length];
   }
 
   static String _time(DateTime t) {
+    final now = DateTime.now();
     String two(int n) => n.toString().padLeft(2, '0');
-    return '${two(t.hour)}:${two(t.minute)}';
+    final hm = '${two(t.hour)}:${two(t.minute)}';
+    final sameDay = t.year == now.year && t.month == now.month && t.day == now.day;
+    if (sameDay) return hm;
+    const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+    return '${months[t.month - 1]} ${t.day}';
+  }
+}
+
+/// Animated three-dot "typing" indicator for the assistant's pending answer.
+class _TypingBubble extends StatefulWidget {
+  const _TypingBubble();
+
+  @override
+  State<_TypingBubble> createState() => _TypingBubbleState();
+}
+
+class _TypingBubbleState extends State<_TypingBubble>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _c =
+      AnimationController(vsync: this, duration: const Duration(milliseconds: 1100))
+        ..repeat();
+
+  @override
+  void dispose() {
+    _c.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    return Align(
+      alignment: Alignment.centerLeft,
+      child: Container(
+        margin: const EdgeInsets.symmetric(vertical: 5),
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+        decoration: BoxDecoration(
+          color: cs.surfaceContainerHigh,
+          borderRadius: BorderRadius.circular(18).copyWith(bottomLeft: const Radius.circular(4)),
+        ),
+        child: AnimatedBuilder(
+          animation: _c,
+          builder: (context, _) {
+            return Row(
+              mainAxisSize: MainAxisSize.min,
+              children: List.generate(3, (i) {
+                final phase = (_c.value + i * 0.2) % 1.0;
+                final o = 0.3 + 0.7 * (phase < 0.5 ? phase * 2 : (1 - phase) * 2);
+                return Padding(
+                  padding: EdgeInsets.only(right: i < 2 ? 5 : 0),
+                  child: Container(
+                    width: 8,
+                    height: 8,
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      color: cs.primary.withValues(alpha: o),
+                    ),
+                  ),
+                );
+              }),
+            );
+          },
+        ),
+      ),
+    );
   }
 }
