@@ -110,6 +110,11 @@ class RecallConfig(BaseSettings):
     # --- retrieval / consolidation knobs ----------------------------------
     near_dup_cosine: float = 0.95
     dualmic_fuzzy_threshold: float = 0.85
+    # Reranking. The npu backend has no cross-encoder ONNX asset, so it reranks
+    # with the on-device LLM (a real relevance judgment, one extra generation
+    # per query). Kill-switch: set RECALL_RERANK_ENABLED=false to skip reranking
+    # entirely (fused+cosine order only) if the NPU LLM is under load.
+    rerank_enabled: bool = True
 
     # --- ollama backend (local dev) --------------------------------------
     ollama_url: str = "http://localhost:11434"
@@ -123,15 +128,15 @@ class RecallConfig(BaseSettings):
 
     # --- npu backend (Snapdragon X Elite) --------------------------------
     # Embedder: Nomic-Embed-Text v1.5 re-exported at seqlen 256/512, ORT-QNN.
-    npu_embed_onnx_256: str = "models/nomic-v1.5-seq256.onnx"
-    npu_embed_onnx_512: str = "models/nomic-v1.5-seq512.onnx"
+    npu_embed_onnx_256: str = "models\\nomic_embed_text-onnx-float\\nomic_embed_text.onnx"
+    npu_embed_onnx_512: str = "models\\nomic_embed_text-onnx-float\\nomic_embed_text.onnx"
     # LLM serving mode:
     #   auto     — use npu_llm_endpoint if a server is already up there, else
     #              load the model in-process via the `geniex` package (which
     #              auto-downloads the precompiled AI Hub bundle on first use)
     #   geniex   — always in-process via geniex (no sidecar to start)
     #   endpoint — only the external OpenAI-compatible server (never in-process)
-    npu_llm_mode: Literal["auto", "geniex", "endpoint"] = "auto"
+    npu_llm_mode: Literal["auto", "geniex", "endpoint"] = "geniex"
     # Model id: a Qualcomm AI Hub bundle id (auto-pulled by geniex, NPU-ready)
     # — also sent as the OpenAI `model` field in endpoint mode, matching how
     # `geniex serve` names its models.
@@ -140,8 +145,11 @@ class RecallConfig(BaseSettings):
     npu_llm_device_map: str = "npu"
     npu_llm_max_new_tokens: int = 1024
     npu_llm_endpoint: str = "http://localhost:8090"
-    # Reranker: Qwen3-Reranker-0.6B via ORT-QNN (bge-reranker CPU fallback).
-    npu_reranker_onnx: str = "models/qwen3-reranker-0.6b.onnx"
+    # Reranker cross-encoder, ORT-QNN. Must be a real .onnx to load — ORT
+    # cannot read .gguf (llama.cpp). Empty (default) => rerank via the on-device
+    # LLM instead (see NpuBackend.reranker / LlmReranker). Point this at a
+    # Qwen3-Reranker .onnx export to run a dedicated cross-encoder on the NPU.
+    npu_reranker_onnx: str = ""
     # HF tokenizer id used for exact on-device token budgeting.
     npu_tokenizer_id: str = "Qwen/Qwen3-4B"
 
@@ -182,7 +190,7 @@ class RecallConfig(BaseSettings):
     # header as STT. Response is JSON {"audios": ["<base64 wav>", ...]}.
     sarvam_tts_endpoint: str = "https://api.sarvam.ai/text-to-speech"
     sarvam_tts_model: str = "bulbul:v3"
-    sarvam_tts_speaker: str = "shubh"          # bulbul:v3 default voice
+    sarvam_tts_speaker: str = "manan"          # bulbul:v3 default voice
     sarvam_tts_language_code: str = "en-IN"   # BCP-47; one of the 11 supported
     sarvam_tts_sample_rate: int = 24000       # Hz — 8000..48000, see docs
     sarvam_tts_codec: str = "wav"             # wav|mp3|linear16|mulaw|alaw|opus|flac|aac
@@ -195,6 +203,6 @@ class RecallConfig(BaseSettings):
     # it needs its own, v2-compatible speaker (the REST default "shubh" is
     # v3-only and gets rejected there).
     sarvam_tts_stream_endpoint: str = "wss://api.sarvam.ai/text-to-speech/ws"
-    sarvam_tts_stream_speaker: str = "anushka"
+    sarvam_tts_stream_speaker: str = "manan"
     cloud_optin: bool = False
 

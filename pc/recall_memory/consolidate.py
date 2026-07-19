@@ -535,34 +535,54 @@ class Consolidator:
             s.detail(result=result)
             return result
 
-    def run_mvp(self) -> dict:
-        """Hackathon MVP: jobs 1, 3, 4, 10."""
+    def run_mvp(self, should_abort=None) -> dict:
+        """Hackathon MVP: jobs 1, 3, 4, 10.
+
+        `should_abort`, when given, is polled BETWEEN jobs: the scheduler passes
+        an "is a capture happening right now?" check so a background Dream pass
+        yields the store to a fresh ingestion the instant the user speaks,
+        instead of making a just-spoken memory's dot wait for the whole pass
+        (LLM summaries/OKF included) to finish. A yielded pass just resumes on
+        the next idle cycle — no job is skipped permanently."""
+        jobs = []
+        if self.ingestor:
+            jobs.append(("dualmic_merged", "job10_dualmic", self.job_dualmic))
+        jobs += [
+            ("duplicates_merged", "job1_dedup", self.job_dedup),
+            ("contradictions_closed", "job3_contradictions", self.job_contradictions),
+            ("importance_updated", "job4_importance", self.job_importance),
+        ]
+        out: dict = {"dualmic_merged": 0}
         with ensure_trace("consolidate", scope="mvp"):
-            out = {"dualmic_merged":
-                   self._run_job("job10_dualmic", self.job_dualmic)
-                   if self.ingestor else 0}
-            out["duplicates_merged"] = self._run_job("job1_dedup", self.job_dedup)
-            out["contradictions_closed"] = self._run_job(
-                "job3_contradictions", self.job_contradictions)
-            out["importance_updated"] = self._run_job(
-                "job4_importance", self.job_importance)
+            for key, name, fn in jobs:
+                if should_abort and should_abort():
+                    out["aborted"] = True
+                    break
+                out[key] = self._run_job(name, fn)
             return out
 
-    def run_full(self) -> dict:
+    def run_full(self, should_abort=None) -> dict:
         """The full Dream tier: MVP jobs + entity resolution, communities, the
-        summary ladder, archival, graph repair, LLM relations, and OKF regen."""
+        summary ladder, archival, graph repair, LLM relations, and OKF regen.
+
+        See run_mvp for `should_abort` — the same check gates every job here so
+        the whole (potentially multi-second, LLM-heavy) pass steps aside for a
+        fresh capture."""
         with ensure_trace("consolidate", scope="full"):
-            out = self.run_mvp()
-            out["entities_resolved"] = self._run_job(
-                "job2_entity_resolution", self.job_entity_resolution)
-            out["communities"] = self._run_job(
-                "job5_communities", self.job_communities)
-            out["summaries"] = self._run_job("job6_summaries", self.job_summaries)
-            out["reembedded"] = self._run_job("job7_reembed", self.job_reembed)
-            out["archived"] = self._run_job("job8_archival", self.job_archival)
-            out["graph_repaired"] = self._run_job(
-                "job9_graph_repair", self.job_graph_repair)
-            out["llm_relations"] = self._run_job(
-                "job_llm_relations", self.job_llm_relations)
-            out["okf"] = self._run_job("okf_generate", self.generate_okf)
+            out = self.run_mvp(should_abort)
+            jobs = [
+                ("entities_resolved", "job2_entity_resolution", self.job_entity_resolution),
+                ("communities", "job5_communities", self.job_communities),
+                ("summaries", "job6_summaries", self.job_summaries),
+                ("reembedded", "job7_reembed", self.job_reembed),
+                ("archived", "job8_archival", self.job_archival),
+                ("graph_repaired", "job9_graph_repair", self.job_graph_repair),
+                ("llm_relations", "job_llm_relations", self.job_llm_relations),
+                ("okf", "okf_generate", self.generate_okf),
+            ]
+            for key, name, fn in jobs:
+                if out.get("aborted") or (should_abort and should_abort()):
+                    out["aborted"] = True
+                    break
+                out[key] = self._run_job(name, fn)
             return out

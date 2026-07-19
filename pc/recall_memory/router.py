@@ -66,4 +66,5 @@ class Router:
         with step("route:extract_entities") as s:
             entities = _extract_entities(query, self.store)
             s.detail(entities=entities)
-        return RoutePlan(entities=entities)
+        rerank = getattr(self.cfg, "rerank_enabled", True) if self.cfg else True
+        return RoutePlan(entities=entities, rerank=rerank)

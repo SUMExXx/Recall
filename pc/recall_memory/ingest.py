@@ -16,10 +16,10 @@ from .backends import get_backend
 from .chunker import build_transcript, chunk_document, chunk_meeting, clip_title
 from .config import RecallConfig
 from .embeddings import matryoshka_coarse
-from .extractors import extract_decisions, extract_entities
+from .extractors import extract_decisions, extract_entities, llm_extract_entities
 from .llm_validate import is_valid_llm_summary
 from .nmo import NMO, Chunk, Episode, new_id
-from .store import MemoryStore
+from .store import MemoryStore, entity_id_for
 from .tracing import ensure_trace, step
 
 log = logging.getLogger("recall.ingest")
@@ -216,6 +216,11 @@ class Ingestor:
         # wait) — so titles start as the extractive guess above and, only
         # when this backend actually has an LLM, get upgraded a moment later
         # by this fire-and-forget pass. Never blocks, never raises outward.
+        # The same background pass also runs LLM entity enrichment (regex
+        # already ran synchronously above so entity_mentions is never empty
+        # even offline) — it adds the multi-word/topical entities regex
+        # can't see, which is what lets genuinely-related memories share an
+        # entity and cluster/link (see [[pipeline-audit]]).
         if chunks and self.backend.llm.available:
             threading.Thread(target=self._refine_titles,
                              args=(nmo.memory_id, list(chunks)), daemon=True).start()
@@ -227,13 +232,39 @@ class Ingestor:
                 with step("refine_title", chunk_id=chunk.chunk_id) as s:
                     title = _llm_chunk_title(llm, chunk.text)
                     s.detail(updated=bool(title))
-                    if not title:
-                        continue
-                    try:
-                        self.store.update_chunk_title(chunk.chunk_id, title)
-                        self.store.commit()
-                    except Exception:
-                        log.warning("chunk title refinement: store update "
-                                   "failed, abandoning rest of memory %s",
-                                   memory_id[:8], exc_info=True)
-                        return
+                    if title:
+                        try:
+                            self.store.update_chunk_title(chunk.chunk_id, title)
+                            self.store.commit()
+                        except Exception:
+                            log.warning("chunk title refinement: store update "
+                                       "failed, abandoning rest of memory %s",
+                                       memory_id[:8], exc_info=True)
+                            return
+                self._enrich_entities_llm(memory_id, chunk, llm)
+
+    def _enrich_entities_llm(self, memory_id: str, chunk: Chunk, llm) -> None:
+        """Add LLM-found entities the regex pass missed. Every candidate was
+        already verified to appear verbatim in chunk.text (llm_extract_entities);
+        here we only additionally skip ones regex already recorded for this
+        chunk — near-duplicates across the two passes (e.g. regex's "Royal
+        Enfield" and the LLM's fuller "Royal Enfield GT") are left for
+        job_entity_resolution's fuzzy merge rather than resolved here."""
+        try:
+            ents = llm_extract_entities(chunk.text, llm)
+        except Exception:
+            log.warning("entity enrichment failed for chunk %s",
+                       chunk.chunk_id, exc_info=True)
+            return
+        if not ents:
+            return
+        added = 0
+        for e in ents:
+            if self.store.entity_mention_exists(chunk.chunk_id, entity_id_for(e["name"])):
+                continue
+            self.store.add_entity_mention(
+                e["name"], e["type"], chunk.chunk_id, memory_id,
+                (e["start"], e["end"]))
+            added += 1
+        if added:
+            self.store.commit()

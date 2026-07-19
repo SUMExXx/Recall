@@ -172,7 +172,7 @@ function refreshLinks() {
   clearTimeout(linksTimer);
   linksTimer = setTimeout(async () => {
     try {
-      edges = await (await fetch('/links?threshold=0.55')).json();
+      edges = await (await fetch('/links?threshold=0.7')).json();
       regroup();   // instant — doesn't wait for the Dream tier
     }
     catch (e) {}
@@ -199,11 +199,12 @@ function regroup() {
   };
   for (const e of edges) { parent[find(e.a)] = find(e.b); }
 
-  const members = {}, whyCount = {};
+  const members = {}, whyCount = {}, labelOf = {};
   for (const e of edges) {
     const root = find(e.a);
     (members[root] ??= new Set()).add(e.a);
     members[root].add(e.b);
+    if (e.label && !labelOf[root]) labelOf[root] = e.label;
     for (const w of (e.why || [])) {
       (whyCount[root] ??= {});
       whyCount[root][w] = (whyCount[root][w] || 0) + 1;
@@ -213,7 +214,9 @@ function regroup() {
   const roots = Object.keys(members).filter(r => members[r].size >= 2);
   roots.forEach((root, gi) => {
     const counts = whyCount[root] || {};
-    const label = Object.keys(counts).sort((a, b) => counts[b] - counts[a])[0]
+    // server-derived topic label first, then most-shared entity, then generic
+    const label = labelOf[root]
+                 || Object.keys(counts).sort((a, b) => counts[b] - counts[a])[0]
                  || 'related';
     for (const id of members[root]) groups[id] = {gi, label};
   });
@@ -750,6 +753,18 @@ async function refreshBench() {
       : '☁ off';
     cloudPill.style.color = pol.cloud_optin ? 'var(--green)' : '';
   } catch (e) { /* hub restarting */ }
+  // Self-heal memory visibility on this same 5s cadence. `memory_added` is a
+  // best-effort WS push fired right at capture time (well before the Dream
+  // tier ever runs) — but if a reconnect race or dropped frame ever misses
+  // it, the ONLY other full resync in this file was `consolidated`, which is
+  // the Dream tier's own separate ~120s cadence. That meant a missed push
+  // could leave a just-captured memory invisible for up to two minutes,
+  // looking exactly like "visibility waits on the Dream tier" even though
+  // the Dream tier never gates it server-side. loadMemories() is idempotent
+  // (addNode skips ids already present) and /dump is a cheap indexed query,
+  // so polling it here costs nothing and closes that gap independently of
+  // whether the Dream tier has run.
+  try { await loadMemories(); refreshLinks(); } catch (e) {}
 }
 
 function esc(s) { const d = document.createElement('div');

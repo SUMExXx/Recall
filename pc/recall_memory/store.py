@@ -372,6 +372,13 @@ class MemoryStore:
             "SELECT 1 FROM entity_mentions WHERE entity_id=? LIMIT 1",
             (entity_id_for(term),)).fetchone() is not None
 
+    def entity_mention_exists(self, chunk_id: int, entity_id: str) -> bool:
+        """For the LLM entity-enrichment pass (ingest.py) to skip re-adding an
+        entity a chunk already has — regex ran first and may have caught it."""
+        return self.db.execute(
+            "SELECT 1 FROM entity_mentions WHERE chunk_id=? AND entity_id=? LIMIT 1",
+            (chunk_id, entity_id)).fetchone() is not None
+
     # ------------------------------------------------------ retrieval routes
 
     @staticmethod
