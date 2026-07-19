@@ -1,113 +1,126 @@
-# Recall PC Hub — Memory Engine + Hub Layers
+# Recall — PC Hub
 
-Implements **`plans/memory_engineering_v2.md`** (memory engine) and the PC-hub
-backend layers of **`docs/system_architectures_v1.md` §4**: gateway (WS hub /
-REST / MCP), ASR workers, proactive recall, policy engine, device registry,
-supervisor, metrics, and the judge dashboard.
+This is the brain of Recall. It's the program that runs on your computer,
+listens to everything you feed it — meetings, notes, PDFs, code, whiteboard
+photos — and turns it into one searchable, private memory you can ask
+questions of later. Everything else (the phone app, the browser extension)
+just sends things here.
 
-Targets the **Snapdragon X Elite / NPU** event PC. One switch runs the exact
-same code on your laptop via Ollama.
+Nothing leaves your device unless you turn on cloud features yourself. By
+default, Recall is entirely offline.
 
-## The one switch — `RECALL_BACKEND`
+**The core idea, in one paragraph:** everything you capture gets broken into
+small searchable pieces, turned into both a keyword index and a "meaning"
+index, and linked up with any people/decisions/facts mentioned in it. When
+you ask a question, Recall searches all of that at once, picks the most
+relevant pieces, and asks a local AI model to write you an answer — with the
+original sources attached, so you can always check where it came from.
 
-| Value | Where | Embedder · LLM · Reranker · Tokenizer |
+## Getting started (Snapdragon X Elite / NPU event PC)
+
+**1. Use ARM64 Python**
+
+The event PC runs Windows on ARM. Install a native **ARM64 build of Python
+3.12+** — not the regular x64 installer running under emulation — otherwise
+the NPU packages below won't install as real, fast, native wheels.
+
+**2. Install the base requirements**
+
+```bash
+cd pc
+pip install -r requirements.txt
+```
+
+This installs everything the hub needs to run at all (the server, the
+database layer, the MCP server). It does **not** yet include the NPU-specific
+pieces — that's the next step.
+
+**3. Get the two models**
+
+Recall's on-device thinking uses two separate models:
+
+| Model | What it's for | How it gets here |
 |---|---|---|
-| `npu` *(default)* | Snapdragon X Elite | Nomic v1.5 (ORT-QNN) · Qwen3-4B (GenieX) · Qwen3-Reranker (ORT-QNN) · HF tokenizer |
-| `ollama` | your laptop | `nomic-embed-text` · `llama3.2:3b` · passthrough · HF tokenizer |
-| `hash` | tests / CI | deterministic hash vectors · none · passthrough · regex |
+| **Nomic-Embed-Text v1.5** | Turns text into a "fingerprint" of numbers so similar meanings can be found later — this is what powers search. | Download the ONNX export from **Qualcomm AI Hub** and drop it into `models/` (see `models/README.md` for exact filenames). |
+| **Qwen3-4B-Instruct** | The model that actually reads your memories and writes the answer. | Nothing to download by hand — **GenieX** (Qualcomm's on-device model runtime) pulls and caches it automatically the first time the hub runs. |
 
-Everything else (model names, service URLs, thresholds) is a `RECALL_*` env var
-bound to `RecallConfig` (pydantic-settings). The backend is the only seam the
-engine turns — see [recall_memory/backends/](recall_memory/backends/).
+**4. Turn on NPU processing**
 
 ```bash
-# laptop: develop against Ollama
-RECALL_BACKEND=ollama python -m recall_memory --db demo.db demo
-# event PC: the default — no flag needed (needs the [npu] extra + model assets)
-python -m recall_memory --db demo.db demo
+pip install -e ".[npu]"
 ```
 
-## Layout
+This adds the Qualcomm-specific packages (`onnxruntime-qnn`, `geniex`) that
+let the models above actually run on the NPU chip instead of the CPU.
 
-Memory engine (`recall_memory/`):
-
-| Module | Plan § | What it does |
-|---|---|---|
-| `config.py` | — | `RecallConfig` (pydantic-settings); the `RECALL_BACKEND` switch + all env-bound settings |
-| `backends/` | §2 | `get_backend()` → Embedder / LLM / Reranker / Tokenizer; `npu` (ORT-QNN + GenieX, guarded), `ollama`, `hash` |
-| `nmo.py` | §3-4 | NMO + Episode + Chunk shapes, universal/source metadata, 3-group chunk metadata |
-| `store.py` | §4d | SQLite: memories, episodes, chunks, entity_mentions, relations (bi-temporal), FTS5, `vec_chunks` vec0 int8[256], `okf`, `summaries`, `communities` |
-| `tokenizer.py` | §5 | `RegexTokenizer` (offline) + `ModelTokenizer` (HF, char-offset aware) behind the backend |
-| `chunker.py` | §5 | Fixed token windows (meeting 256/15%, code 256/10%, pdf 400/12%, OCR whole-block), speaker-attribution rule |
-| `embeddings.py` | §2, §9 | Matryoshka float[768] → int8[256] math + offline `HashEmbedder` |
-| `extractors.py` | §6 | Cheap-first entity/decision/action-item extraction; LLM relation-extraction fallback |
-| `ingest.py` | §14a | Normalize → NMO → enrich → chunk → embed → write every index |
-| `router.py` | — | Entity extraction for the entity_index/graph routes. The 4-tier LLM-planner router (plan §8) was removed — it cost 5-8s/query for classification value the trace logs showed wasn't paying for itself; every query now gets one fixed plan (bm25+vector+graph+entity_index, RRF general profile, always reranked). |
-| `retrieval.py` | §9-11 | needs{}-gated parallel indices, weighted RRF k=60, recency/importance boost, float[768] rescore, reranker, small-to-big, **OKF skim**, cited answers |
-| `okf.py` | §7 | Organized Knowledge Files — per-repo/meeting/pdf manifests, regenerated when content changes |
-| `consolidate.py` | §12 | Dream tier — MVP jobs 1/3/4/10 **and** full jobs 2 (entity resolution), 5 (communities), 6 (summary ladder), 8 (archival), 9 (graph repair), OKF regen |
-| `cli.py` | — | `demo / ask / search / ingest-* / forget / consolidate [--full] / stats` |
-
-Hub layers (`docs/system_architectures_v1.md` §4):
-
-| Module | Arch box | What it does |
-|---|---|---|
-| `hub/app.py` | GW | **FastAPI** gateway: WS hub (topics, seq, resume tokens, binary PCM16 ingest), REST with Pydantic models (`/ask /search /forget /consolidate /dump /links /digest /policy /health /stats /metrics /devices`), dashboard + capture pages |
-| `hub/mcp_server.py` | GW | MCP server on the **official `mcp` SDK** (FastMCP): `recall_search_memory, recall_ask, recall_bookmark_moment, recall_forget_range, recall_dump` |
-| `hub/asr.py` | NPU | ASRProvider workers (plan §2): whisper.cpp-contract local provider, Hinglish BYOM slot, policy-gated Sarvam stub, selection policy + fallback chain |
-| `hub/sessions.py` | CORE | Live meeting sessions: utterance buffering, bookmark, forget-last-N-min, ingest on `meeting_end` |
-| `hub/proactive.py` | CORE | Proactive recall: rolling 45 s window, threshold + 60 s cooldown → recall push + LED |
-| `hub/policy.py` | CORE | Privacy tags, cloud opt-in (default OFF), outbox for batch cloud jobs |
-| `hub/metrics.py` | REL | Bench logger: p50/p95 per stage (asr, proactive, ask_total, ingest…) |
-| `hub/registry.py` | REL | Device registry: heartbeats, 30 s leases, resume tokens |
-| `hub/dashboard/` | UI | Judge dashboard + `/capture` web-mic fallback |
-
-## Quick start (laptop)
-
-Tasks run through [`dev.py`](dev.py) — plain Python, no `make` needed, same on
-Windows / macOS / Linux:
+**5. Start the hub**
 
 ```bash
-python dev.py setup                       # venv (py 3.12) + pip install -e ".[dev]"
-python dev.py test                        # 44 tests, offline (hash backend)
-python dev.py demo                        # seed sample cross-source data
-python dev.py ask "Who decided to use JWT authentication?"
-python dev.py consolidate                 # MVP: dual-mic merge + dedup + contradictions + importance
-python dev.py consolidate --full          # full Dream tier: + OKF, communities, summaries, entity resolution
+python scripts/run_hub.py
 ```
 
-Every command takes `--backend ollama|npu|hash` (default `$RECALL_BACKEND` or
-`ollama`). The engine also installs a `recall` console script — e.g. the forget
-button:
+That's it — the dashboard is at `http://localhost:8000`, and your phone or
+browser extension can now point at this PC to save and search memories.
+
+> **Don't have the Snapdragon hardware?** You can run all of this on a normal
+> laptop instead, using [Ollama](https://ollama.com) in place of steps 3–4:
+> `RECALL_BACKEND=ollama python scripts/run_hub.py`. Same code, same
+> features, just a different (slower, non-NPU) engine underneath.
+
+## Directory structure, briefly
+
+```
+pc/
+├── recall_memory/     the memory engine: chunking, embeddings, storage,
+│                       search/retrieval, and the background "tidy up" job
+├── hub/                the server: the API, the live dashboard, and the
+│                       MCP server Claude connects to
+├── models/             NPU model files go here (see step 3 above)
+├── scripts/run_hub.py  starts everything
+└── tests/              the test suite — runs fully offline, no models needed
+```
+
+## How search actually works (briefly)
+
+When you ask a question, Recall doesn't just do one search — it runs a
+keyword search, a "meaning" (vector) search, and a search over how people and
+topics are connected, all at once. It merges those results, re-ranks them for
+genuine relevance, and only then hands the best handful of passages to the
+language model to write a cited answer. This is why Recall can answer things
+like "what did we decide" and not just "find me the word decide."
+
+## The database, briefly
+
+Everything lives in **one SQLite file**. The tables that matter most:
+
+- **memories** — one row per thing you saved (a meeting, a PDF, a note…)
+- **chunks** — the smaller, searchable pieces each memory gets split into
+- **episodes** — individual spoken lines, for meetings specifically
+- **entity_mentions / relations** — the "who/what is connected to what" graph
+- **fts_chunks** / **vec_chunks** — the keyword index and the meaning index that make search fast
+
+## Using Recall from Claude (or any MCP-compatible tool)
+
+Recall ships its own MCP server, so Claude Desktop, Claude Code, or any other
+MCP client can search and ask your memory directly, like any other tool it
+has access to.
+
+**What it can do:**
+
+| Tool | What it does |
+|---|---|
+| `recall_search_memory` | Search memory, get back cited snippets |
+| `recall_ask` | Ask a full question, get a synthesized, cited answer |
+| `recall_bookmark_moment` | Mark the most recent memory as important |
+| `recall_forget_range` | Delete a window of memory (e.g. the last 5 minutes of a meeting) |
+| `recall_dump` | List everything currently stored |
+
+**To connect it:**
 
 ```bash
-recall --db demo.db --backend ollama forget --meeting mtg-auth-sync --last-minutes 5
+claude mcp add recall -- <path-to-pc>/.venv/Scripts/python.exe -m hub.mcp_server --db <path-to-pc>/demo_hub.db --backend ollama
 ```
 
-## Running the hub
-
-```bash
-python dev.py hub --port 8000            # seeds demo_hub.db, serves :8000
-```
-
-- Dashboard: http://localhost:8000 · web-mic capture: http://localhost:8000/capture
-- Capture devices connect to `ws://<hub>:8000/ws`: `hello` → `meeting_start` →
-  `utterance` (text) or binary PCM16 frames (transcribed in ~4 s windows,
-  in-process via faster-whisper by default; `RECALL_ASR_MODE=http` for an
-  external server) → `button` (bookmark / forget_last) → `meeting_end`.
-- Untitled captures are auto-titled from the first thing said.
-- MCP (Claude Desktop / Claude Code):
-  `claude mcp add recall -- <pc>/.venv/Scripts/python.exe -m hub.mcp_server --db <pc>/demo_hub.db --backend ollama`
-
-## Event PC (Snapdragon X Elite)
-
-```bash
-pip install -e ".[npu]"          # onnxruntime-qnn (ARM64), transformers, onnx
-# drop the model assets into models/ (see models/README.md), then:
-python -m hub                    # RECALL_BACKEND defaults to npu
-```
-
-No code path changes between laptop and event PC — only the backend switch and
-the model assets. The NPU providers in `backends/npu.py` are written against the
-ORT-QNN / GenieX-QAIRT contracts with guarded imports, so the package still
-imports and the `ollama`/`hash` backends still run without the QNN runtime.
+Swap `--backend ollama` for `npu` on the event PC. Once connected, you can
+just ask Claude things like "search my memory for the JWT decision" and it
+will call the tool for you.
