@@ -25,6 +25,7 @@ The engine's models come from the active backend (RECALL_BACKEND: npu | ollama
 from __future__ import annotations
 
 import asyncio
+import base64
 import io
 import itertools
 import json
@@ -40,11 +41,11 @@ import anyio
 import numpy as np
 from fastapi import (FastAPI, HTTPException, Query, Response, WebSocket,
                      WebSocketDisconnect)
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from recall_memory.backends import get_backend
-from recall_memory.config import RecallConfig
+from recall_memory.config import DIM_FULL, RecallConfig
 from recall_memory.consolidate import Consolidator
 from recall_memory.ingest import Ingestor
 from recall_memory.retrieval import Retriever
@@ -157,6 +158,33 @@ def pcm16_to_wav(pcm: bytes, rate: int = SAMPLE_RATE) -> bytes:
     return buf.getvalue()
 
 
+async def stream_sync_generator(gen_fn, *args):
+    """Bridge a blocking/sync generator (e.g. Retriever.ask_stream, which
+    makes blocking HTTP/websocket calls per item) onto an async generator,
+    so a route can `async for` it without blocking the event loop. Runs
+    gen_fn(*args) in a worker thread; each yielded item is relayed back via
+    an anyio memory object stream using the documented "call async code from
+    a worker thread" pattern (anyio.from_thread.run only works for threads
+    started with anyio.to_thread.run_sync, which is why the thread is
+    started here rather than with plain threading.Thread)."""
+    send_stream, receive_stream = anyio.create_memory_object_stream(max_buffer_size=64)
+
+    def _worker():
+        try:
+            for item in gen_fn(*args):
+                anyio.from_thread.run(send_stream.send, item)
+        except Exception as e:
+            anyio.from_thread.run(send_stream.send, {"type": "error", "error": str(e)})
+        finally:
+            anyio.from_thread.run(send_stream.aclose)
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(anyio.to_thread.run_sync, _worker)
+        async with receive_stream:
+            async for item in receive_stream:
+                yield item
+
+
 class HubState:
     def __init__(self, cfg: RecallConfig):
         self.cfg = cfg
@@ -185,7 +213,9 @@ class HubState:
             model=cfg.sarvam_tts_model, speaker=cfg.sarvam_tts_speaker,
             language_code=cfg.sarvam_tts_language_code,
             sample_rate=cfg.sarvam_tts_sample_rate, codec=cfg.sarvam_tts_codec,
-            pace=cfg.sarvam_tts_pace, timeout=cfg.sarvam_tts_timeout_s)
+            pace=cfg.sarvam_tts_pace, timeout=cfg.sarvam_tts_timeout_s,
+            stream_endpoint=cfg.sarvam_tts_stream_endpoint,
+            stream_speaker=cfg.sarvam_tts_stream_speaker)
         # WS fabric — keyed per CONNECTION, not per device_id: two tabs may
         # both hello as "dashboard", and a reconnect must not steal the event
         # stream from a socket that is still alive.
@@ -496,6 +526,25 @@ async def warmup():
                 except Exception as e:
                     report["llm"] = f"unavailable: {e}"
                     st.detail(error=str(e))
+            with step("warmup:reranker") as st:
+                # A REAL cross-encoder (bge-reranker-local) loads its weights
+                # from Hugging Face — a fresh process pays for that download
+                # + load on whichever call hits it first. Without this, that
+                # was the first live /ask a user made (seen as a 128s
+                # rerank:cross_encoder step in production) instead of here,
+                # before any request is served.
+                try:
+                    if s.retriever.reranker.name != "passthrough":
+                        t0 = time.perf_counter()
+                        s.retriever.reranker.rerank("warmup", [(0, 0.0, "warmup text")])
+                        report["reranker_ms"] = round((time.perf_counter() - t0) * 1000)
+                        st.detail(ms=report["reranker_ms"])
+                    else:
+                        report["reranker"] = "passthrough"
+                        st.detail(reranker="passthrough")
+                except Exception as e:
+                    report["reranker"] = f"unavailable: {e}"
+                    st.detail(error=str(e))
         return report
 
     log.info("warmup: %s", await anyio.to_thread.run_sync(_warm))
@@ -601,6 +650,51 @@ async def tts_ep(body: TtsRequest):
     return Response(content=audio, media_type=media_type)
 
 
+@app.post("/ask/stream")
+async def ask_stream_ep(body: AskRequest):
+    """SSE version of /ask: streams the LLM's answer as it's generated
+    ({"type": "delta", "text": ...} events) and, when cloud is opted in,
+    Sarvam TTS audio chunks alongside it ({"type": "audio", "audio_b64":
+    ...}) fed from that SAME generation pass — see Retriever.ask_stream.
+    Ends with one {"type": "done", answer, latency_ms, plan, sources}."""
+    s = get_state()
+    await s.set_led("searching")
+    tts = s.tts if s.policy.is_cloud_allowed() else None
+    t0 = time.perf_counter()
+
+    async def _gen():
+        try:
+            async for event in stream_sync_generator(
+                    s.retriever.ask_stream, body.query, body.k, tts):
+                etype = event.get("type")
+                if etype == "audio":
+                    out = {"type": "audio",
+                          "audio_b64": base64.b64encode(event["audio"]).decode("ascii")}
+                elif etype == "done":
+                    plan = event["plan"]
+                    sources = [{"citation": c.citation(), "title": c.title,
+                               "chunk_title": c.chunk_title, "memory_id": c.memory_id,
+                               "source_type": c.source_type, "snippet": c.text[:200],
+                               "score": round(c.score, 3)} for c in event["contexts"]]
+                    out = {"type": "done", "answer": event["answer"],
+                          "latency_ms": round((time.perf_counter() - t0) * 1000),
+                          "plan": {"query_type": plan.query_type,
+                                  "weight_profile": plan.weight_profile,
+                                  "filters": plan.filters},
+                          "sources": sources}
+                    await s.set_led("recalled" if sources else "idle",
+                                    reset_after=5.0 if sources else None)
+                else:
+                    out = event   # {"type": "delta", "text": ...} or an error event
+                yield f"data: {json.dumps(out)}\n\n"
+        except Exception as e:
+            log.exception("ask_stream failed: %r", body.query[:60])
+            await s.set_led("error", reset_after=5.0)
+            yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
+
+    return StreamingResponse(_gen(), media_type="text/event-stream")
+
+
 @app.post("/forget")
 async def forget_ep(body: ForgetRequest):
     s = get_state()
@@ -678,9 +772,13 @@ async def links_ep(threshold: float = Query(0.55)):
                FROM entity_mentions em JOIN memories m
                  ON m.memory_id = em.memory_id WHERE m.archived = 0""").fetchall()
     by_mem: dict[str, list] = {}
+    _expected_bytes = DIM_FULL * 4   # float32
     for r in rows:
+        blob = r["emb_full"]
+        if blob is None or len(blob) != _expected_bytes:
+            continue   # skip NULL or wrong-dim blobs (model change, partial ingest)
         by_mem.setdefault(r["memory_id"], []).append(
-            np.frombuffer(r["emb_full"], dtype=np.float32))
+            np.frombuffer(blob, dtype=np.float32))
     ents: dict[str, set] = {}
     ent_text: dict[str, str] = {}
     for r in ent_rows:

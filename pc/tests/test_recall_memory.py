@@ -38,6 +38,11 @@ class FakeLLM:
         self.calls.append({"prompt": prompt, "json": json, "schema": schema})
         return self.responses.pop(0)
 
+    def generate_stream(self, prompt, *, timeout=180.0):
+        self.calls.append({"prompt": prompt, "stream": True})
+        for word in self.responses.pop(0).split(" "):
+            yield word + " "
+
 
 @pytest.fixture()
 def cfg():
@@ -244,6 +249,25 @@ def test_ollama_reranker_falls_back_when_sentence_transformers_missing(monkeypat
     from recall_memory.backends.ollama import OllamaBackend
     cfg = RecallConfig(backend="ollama", reranker_model="BAAI/bge-reranker-v2-m3")
     assert OllamaBackend(cfg).reranker.name == "passthrough"
+
+
+def test_local_transformers_reranker_sigmoid_normalizes_scores(monkeypatch):
+    """bge-reranker-v2-m3 emits an unbounded logit, not a 0-1 score — without
+    sigmoid-normalizing it, retrieval.py's relevance_cutoff has no meaningful
+    number to threshold against."""
+    from recall_memory.backends.ollama import LocalTransformersReranker
+
+    class FakeCrossEncoder:
+        model = type("M", (), {"device": "cpu"})()
+
+        def predict(self, pairs):
+            return np.array([10.0, -10.0])
+
+    reranker = LocalTransformersReranker("fake-model")
+    monkeypatch.setattr(reranker, "_load", lambda: FakeCrossEncoder())
+    scores = dict(reranker.rerank("q", [(1, 0.0, "relevant"), (2, 0.0, "irrelevant")]))
+    assert scores[1] > 0.99
+    assert scores[2] < 0.01
 
 
 # ----------------------------------------------------------- embeddings
@@ -688,3 +712,117 @@ def test_ask_offline_fallback(seeded, monkeypatch):
     out = r.ask("Who decided to use JWT authentication?")
     assert out["contexts"]
     assert "LLM unavailable" in out["answer"] or "NOTFOUND" not in out["answer"]
+
+
+def test_no_context_answer_uses_llm_when_available(store, cfg, ingestor):
+    """Empty retrieval must still speak through the LLM (an honest "I don't
+    know that yet"), not the bare NOTFOUND literal it used to hand back."""
+    r = Retriever(store, cfg, ingestor.backend)
+    r.llm = FakeLLM(["I haven't recorded anything about your weekend plans."])
+    out = r.ask("what are my weekend plans")
+    assert out["contexts"] == []
+    assert out["answer"] == "I haven't recorded anything about your weekend plans."
+    assert r.llm.calls
+
+
+def test_no_context_answer_falls_back_without_llm(store, cfg, ingestor):
+    r = Retriever(store, cfg, ingestor.backend)   # hash backend -> NullLLM
+    out = r.ask("what are my weekend plans")
+    assert out["contexts"] == []
+    assert out["answer"] == "I don't have anything recorded about that yet."
+
+
+def test_relevance_cutoff_drops_low_cross_encoder_score(store, cfg, ingestor):
+    """Reproduces a real trace-log bug: a chunk about an unrelated topic
+    (an "office party" note) rode into the LLM's context alongside the
+    actually-relevant "CB350 bike" one, because it picked up an incidental
+    BM25/vector hit and the old cutoff only ever looked at vector cosine —
+    the reranker's own (near-zero) verdict was computed but never applied."""
+    good_id = ingestor.ingest_document("note", "Bike", "I want to buy a CB350 bike.")
+    bad_id = ingestor.ingest_document(
+        "note", "Party", "What is the plan for the office party tomorrow.")
+    good_chunk = store.db.execute(
+        "SELECT chunk_id FROM chunks WHERE memory_id=?", (good_id,)).fetchone()["chunk_id"]
+    bad_chunk = store.db.execute(
+        "SELECT chunk_id FROM chunks WHERE memory_id=?", (bad_id,)).fetchone()["chunk_id"]
+
+    class FakeReranker:
+        name = "fake-cross-encoder"
+
+        def rerank(self, query, candidates):
+            scores = {good_chunk: 0.9, bad_chunk: 0.01}
+            return sorted(((cid, scores.get(cid, 0.0)) for cid, _sc, _text in candidates),
+                          key=lambda t: -t[1])
+
+    r = Retriever(store, cfg, ingestor.backend, reranker=FakeReranker())
+    results = r.retrieve("what is bike name", top_k=6)
+    ids = {c.chunk_id for c in results}
+    assert good_chunk in ids
+    assert bad_chunk not in ids
+
+
+# ---------------------------------------------------------- ask (streaming)
+
+def test_ask_stream_yields_deltas_and_final_done(store, cfg, ingestor):
+    ingestor.ingest_document("note", "Auth", "We decided to use JWT for authentication.")
+    r = Retriever(store, cfg, ingestor.backend)
+    r.llm = FakeLLM(["JWT was chosen for authentication."])
+    events = list(r.ask_stream("What did we decide about authentication?"))
+    assert events[-1]["type"] == "done"
+    deltas = "".join(e["text"] for e in events if e["type"] == "delta")
+    assert deltas.strip() == "JWT was chosen for authentication."
+    assert events[-1]["answer"].strip() == deltas.strip()
+    assert events[-1]["contexts"]
+
+
+def test_ask_stream_no_context_still_yields_delta_and_done(store, cfg, ingestor):
+    r = Retriever(store, cfg, ingestor.backend)
+    r.llm = FakeLLM(["I don't have anything recorded about that yet."])
+    events = list(r.ask_stream("what are my weekend plans"))
+    assert events[0]["type"] == "delta"
+    assert events[-1] == {"type": "done",
+                         "answer": "I don't have anything recorded about that yet.",
+                         "plan": events[-1]["plan"], "contexts": [], "okf": None}
+
+
+class _FakeTTS:
+    def __init__(self):
+        self.chunks_received = []
+
+    def stream_synthesize(self, text_chunks):
+        for chunk in text_chunks:
+            self.chunks_received.append(chunk)
+            yield f"AUDIO:{chunk}".encode()
+
+
+def test_ask_stream_feeds_tts_the_same_text_as_the_deltas(store, cfg, ingestor):
+    """One LLM pass must drive both the visible transcript and the spoken
+    audio — the TTS pump gets the same deltas as they're yielded (when there
+    are no citations to strip; see the next test for that case), not a
+    separate/second generation."""
+    ingestor.ingest_document("note", "Auth", "We decided to use JWT for authentication.")
+    r = Retriever(store, cfg, ingestor.backend)
+    r.llm = FakeLLM(["JWT was chosen for authentication."])
+    tts = _FakeTTS()
+    events = list(r.ask_stream("What did we decide about authentication?", tts=tts))
+    audio_events = [e for e in events if e["type"] == "audio"]
+    deltas = "".join(e["text"] for e in events if e["type"] == "delta")
+    assert audio_events
+    assert "".join(tts.chunks_received) == deltas
+
+
+def test_ask_stream_strips_citations_before_they_reach_tts(store, cfg, ingestor):
+    """Real bug: a citation like "[84242352:2]" was being sent to TTS
+    verbatim and read aloud as garbled digits, even though the dashboard
+    already stripped it for the visible transcript — the two must match."""
+    ingestor.ingest_document("note", "Bike", "I want to buy a CB350 bike.")
+    r = Retriever(store, cfg, ingestor.backend)
+    r.llm = FakeLLM(["You are wanting to buy a CB350 bike [84242352:2]."])
+    tts = _FakeTTS()
+    events = list(r.ask_stream("which bike am I looking for", tts=tts))
+    deltas = "".join(e["text"] for e in events if e["type"] == "delta")
+    spoken = "".join(tts.chunks_received)
+    assert "[84242352:2]" in deltas          # displayed/raw text still has it
+    assert "[" not in spoken and "]" not in spoken   # TTS never sees it
+    assert "84242352" not in spoken
+    assert "CB350 bike" in spoken

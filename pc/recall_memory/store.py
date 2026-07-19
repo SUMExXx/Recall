@@ -259,7 +259,15 @@ class MemoryStore:
 
     def add_chunk(self, chunk: Chunk, mem_rowid: int,
                   emb_full: np.ndarray, emb_coarse: np.ndarray) -> int:
-        assert emb_full.shape == (DIM_FULL,) and emb_coarse.shape == (DIM_COARSE,)
+        if emb_full.shape != (DIM_FULL,):
+            raise ValueError(
+                f"emb_full has shape {emb_full.shape}; expected ({DIM_FULL},). "
+                "Set RECALL_EMBEDDING_DIM to match your embedder's output dimension."
+            )
+        if emb_coarse.shape != (DIM_COARSE,):
+            raise ValueError(
+                f"emb_coarse has shape {emb_coarse.shape}; expected ({DIM_COARSE},)."
+            )
         cur = self.db.execute(
             """INSERT INTO chunks(memory_id, chunk_index, token_count, text,
                  char_start, char_end, title, episode_ids, t_start, t_end,

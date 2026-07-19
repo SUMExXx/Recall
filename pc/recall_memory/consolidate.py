@@ -96,15 +96,16 @@ class Consolidator:
 
     def _merge_into(self, keep_id: str, drop_id: str, reason: str):
         """Archive `drop`, cascade its index entries away, log the merge."""
-        self.store.append_history(keep_id, "merge", drop_id, f"absorbed ({reason})")
-        chunk_ids = [r["chunk_id"] for r in self.store.db.execute(
-            "SELECT chunk_id FROM chunks WHERE memory_id=?", (drop_id,))]
-        self.store._delete_chunks(chunk_ids)
-        self.store.db.execute("DELETE FROM episodes WHERE memory_id=?", (drop_id,))
-        self.store.db.execute("UPDATE relations SET memory_id=? WHERE memory_id=?", (keep_id, drop_id))
-        self.store.db.execute(
-            "UPDATE memories SET archived=1, updated_at=? WHERE memory_id=?",
-            (now_epoch(), drop_id))
+        with self.store.lock:
+            self.store.append_history(keep_id, "merge", drop_id, f"absorbed ({reason})")
+            chunk_ids = [r["chunk_id"] for r in self.store.db.execute(
+                "SELECT chunk_id FROM chunks WHERE memory_id=?", (drop_id,))]
+            self.store._delete_chunks(chunk_ids)
+            self.store.db.execute("DELETE FROM episodes WHERE memory_id=?", (drop_id,))
+            self.store.db.execute("UPDATE relations SET memory_id=? WHERE memory_id=?", (keep_id, drop_id))
+            self.store.db.execute(
+                "UPDATE memories SET archived=1, updated_at=? WHERE memory_id=?",
+                (now_epoch(), drop_id))
 
     # --------------------------------------------- job 3: contradictions
 
@@ -325,10 +326,9 @@ class Consolidator:
 
         for mems in ent_to_mems.values():
             members = list(mems)
-            for m in members:
-                find(m)
+            root = find(members[0])
             for m in members[1:]:
-                parent[find(members[0])] = find(m)
+                parent[find(m)] = root
         comps: dict[str, set] = {}
         for m in list(parent):
             comps.setdefault(find(m), set()).add(m)

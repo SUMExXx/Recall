@@ -161,7 +161,7 @@ class RecallConfig(BaseSettings):
     sarvam_api_key: str = "sk_kobw09xo_JqDdUSFxsT6AmRQIV38qQglc"
     sarvam_endpoint: str = "https://api.sarvam.ai/speech-to-text"
     sarvam_model: str = "saaras:v3"          # saaras:v3 (recommended) | saarika:v2.5
-    sarvam_language_code: str = "unknown"    # BCP-47, or "unknown" to auto-detect
+    sarvam_language_code: str = "en-IN"    # BCP-47, or "unknown" to auto-detect
     sarvam_mode: str = "transcribe"          # transcribe|translate|verbatim|translit|codemix
     sarvam_timeout_s: float = 10.0           # primary path now — generous before local fallback
 
@@ -176,5 +176,13 @@ class RecallConfig(BaseSettings):
     sarvam_tts_codec: str = "wav"             # wav|mp3|linear16|mulaw|alaw|opus|flac|aac
     sarvam_tts_pace: float = 1.0              # 0.5-2.0
     sarvam_tts_timeout_s: float = 15.0
+    # Streaming TTS (wss://.../text-to-speech/ws) — a separate endpoint from
+    # the REST one above, used for the full-pipeline streaming /ask/stream.
+    # Confirmed directly against the real endpoint: it currently serves
+    # bulbul:v2 regardless of what "model" is sent in the config message, so
+    # it needs its own, v2-compatible speaker (the REST default "shubh" is
+    # v3-only and gets rejected there).
+    sarvam_tts_stream_endpoint: str = "wss://api.sarvam.ai/text-to-speech/ws"
+    sarvam_tts_stream_speaker: str = "anushka"
     cloud_optin: bool = False
 

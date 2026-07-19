@@ -13,7 +13,9 @@ API, so the exact same engine code runs against it. Selected with
 """
 from __future__ import annotations
 
+import json
 import logging
+import math
 from functools import cached_property
 
 import numpy as np
@@ -99,6 +101,28 @@ class OllamaLLM:
         r.raise_for_status()
         return r.json()["message"]["content"].strip()
 
+    def generate_stream(self, prompt: str, *, timeout: float = 180.0):
+        """Like generate(), but yields text deltas as Ollama produces them
+        (NDJSON — one `{"message": {"content": "..."}, "done": bool}` object
+        per line) instead of waiting for the full completion. No schema/json
+        mode here — those need the whole object to parse, which defeats
+        streaming; use generate() for structured output."""
+        import requests
+        body = {"model": self.model, "stream": True, "keep_alive": "30m",
+                "options": {"num_predict": 320}, "think": False,
+                "messages": [{"role": "user", "content": prompt}]}
+        r = requests.post(f"{self.url}/api/chat", json=body, timeout=timeout, stream=True)
+        r.raise_for_status()
+        for line in r.iter_lines():
+            if not line:
+                continue
+            obj = json.loads(line)
+            delta = obj.get("message", {}).get("content", "")
+            if delta:
+                yield delta
+            if obj.get("done"):
+                break
+
 
 class LocalTransformersReranker:
     """Local CPU/GPU cross-encoder reranker using Hugging Face sentence-transformers.
@@ -129,8 +153,13 @@ class LocalTransformersReranker:
                   candidates=len(candidates)) as s:
             model = self._load()
             pairs = [[query, text] for _, _, text in candidates]
-            scores = model.predict(pairs)
-            scored = [(candidates[i][0], float(scores[i]))
+            raw = model.predict(pairs)
+            # bge-reranker-v2-m3 emits a single unbounded logit, not a 0-1
+            # score — sigmoid-normalize it (the model card's own convention)
+            # so retrieval.py's relevance_cutoff can threshold it meaningfully
+            # instead of comparing raw, unnormalized logits against a magic
+            # number.
+            scored = [(candidates[i][0], 1.0 / (1.0 + math.exp(-float(raw[i]))))
                      for i in range(len(candidates))]
             scored.sort(key=lambda t: -t[1])
             s.detail(device=str(model.model.device))

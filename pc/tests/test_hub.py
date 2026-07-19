@@ -280,10 +280,53 @@ def test_rest_ask_and_forget_flow(client, state):
     assert client.post("/forget", json={}).status_code == 400
 
 
+class _FakeStreamLLM:
+    """Minimal backend.llm stand-in with a scripted generate_stream, for
+    exercising /ask/stream without a real Ollama instance."""
+    name = "fake"
+    model = "fake-model"
+    available = True
+
+    def __init__(self, response: str):
+        self.response = response
+
+    def generate(self, prompt, *, json=False, schema=None, timeout=180.0):
+        return self.response
+
+    def generate_stream(self, prompt, *, timeout=180.0):
+        for word in self.response.split(" "):
+            yield word + " "
+
+
+def test_rest_ask_stream_sse(client, state):
+    """/ask/stream must deliver the same answer as /ask, just as a sequence
+    of delta events ending in one done event with sources/plan/latency."""
+    seed(state.ingestor)
+    state.retriever.llm = _FakeStreamLLM("JWT was chosen for auth [84242352:1].")
+    with client.stream("POST", "/ask/stream",
+                       json={"query": "Who decided to use JWT?"}) as r:
+        events = [json.loads(line[len("data: "):])
+                 for line in r.iter_lines() if line.startswith("data: ")]
+    assert events[-1]["type"] == "done"
+    assert events[-1]["sources"]
+    deltas = "".join(e["text"] for e in events if e["type"] == "delta")
+    assert deltas.strip() == "JWT was chosen for auth [84242352:1]."
+    assert events[-1]["answer"].strip() == deltas.strip()
+
+
 def test_rest_consolidate(client, state):
     seed(state.ingestor)
     out = client.post("/consolidate").json()
     assert out["dualmic_merged"] == 1
+
+
+def test_warmup_covers_reranker(state):
+    """A real cross-encoder reranker loads its weights from Hugging Face on
+    first use — that cost belongs at startup (here), not on a live user's
+    first /ask (seen for real as a 128s rerank:cross_encoder trace step).
+    On the hash backend (passthrough reranker) this just exercises the
+    "nothing to warm" branch without needing the heavy model."""
+    anyio.run(hub_app.warmup)
 
 
 def test_led_auto_resets_to_idle_after_delay(state):
