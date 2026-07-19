@@ -443,15 +443,9 @@ class Consolidator:
                 "UPDATE chunks SET emb_full=?, processing_version=? WHERE chunk_id=?",
                 (full[i].astype(np.float32).tobytes(), PROCESSING_VERSION,
                  r["chunk_id"]))
-            # vec0 virtual tables don't support partial-column UPDATE reliably —
-            # same delete+reinsert pattern MemoryStore.add_chunk uses.
             self.store.db.execute(
-                "DELETE FROM vec_chunks WHERE chunk_id=?", (r["chunk_id"],))
-            self.store.db.execute(
-                """INSERT INTO vec_chunks(chunk_id, mem_rowid, created_at,
-                     source_type, emb_coarse) VALUES (?,?,?,?,vec_int8(?))""",
-                (r["chunk_id"], r["mem_rowid"], r["created_at"], r["source_type"],
-                 coarse[i].astype(np.int8).tobytes()))
+                "UPDATE vec_chunks SET emb_coarse=? WHERE chunk_id=?",
+                (coarse[i].astype(np.int8).tobytes(), r["chunk_id"]))
         self.store.commit()
         return len(rows)
 
