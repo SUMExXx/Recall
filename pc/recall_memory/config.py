@@ -157,7 +157,7 @@ class RecallConfig(BaseSettings):
     # auto (default): transcribe in-process via faster-whisper when installed,
     #   else fall back to the HTTP contract below. embedded: require in-process.
     #   http: always use the external server (the event PC's ORT-QNN Whisper).
-    asr_mode: Literal["auto", "embedded", "http"] = "auto"
+    asr_mode: Literal["auto", "embedded", "http"] = "http"
     whisper_model: str = "base.en"                 # faster-whisper model (in-process)
     whisper_url: str = "http://localhost:8080"     # http mode: whisper.cpp contract
     hinglish_url: str = "http://localhost:8081"    # Oriserve Hinglish BYOM slot
@@ -189,8 +189,8 @@ class RecallConfig(BaseSettings):
     # POST https://api.sarvam.ai/text-to-speech, same api-subscription-key
     # header as STT. Response is JSON {"audios": ["<base64 wav>", ...]}.
     sarvam_tts_endpoint: str = "https://api.sarvam.ai/text-to-speech"
-    sarvam_tts_model: str = "bulbul:v3"
-    sarvam_tts_speaker: str = "manan"          # bulbul:v3 default voice
+    sarvam_tts_model: str = "saaras:v3"
+    sarvam_tts_speaker: str = "shubh"          # bulbul:v3 default voice
     sarvam_tts_language_code: str = "en-IN"   # BCP-47; one of the 11 supported
     sarvam_tts_sample_rate: int = 24000       # Hz — 8000..48000, see docs
     sarvam_tts_codec: str = "wav"             # wav|mp3|linear16|mulaw|alaw|opus|flac|aac
@@ -203,6 +203,6 @@ class RecallConfig(BaseSettings):
     # it needs its own, v2-compatible speaker (the REST default "shubh" is
     # v3-only and gets rejected there).
     sarvam_tts_stream_endpoint: str = "wss://api.sarvam.ai/text-to-speech/ws"
-    sarvam_tts_stream_speaker: str = "manan"
+    sarvam_tts_stream_speaker: str = "shubh"
     cloud_optin: bool = False
 
