@@ -23,6 +23,28 @@ Float32List pcm16ToFloat32(Uint8List bytes) {
   return out;
 }
 
+/// Encodes 16 kHz mono float samples [-1, 1] as a PCM16 WAV file — the upload
+/// format for cloud STT (Sarvam).
+Uint8List floatSamplesToWav(Float32List samples, {int sampleRate = 16000}) {
+  final dataSize = samples.length * 2;
+  final pcm = Uint8List(dataSize);
+  final view = ByteData.view(pcm.buffer);
+  for (var i = 0; i < samples.length; i++) {
+    final s = (samples[i] * 32767).round().clamp(-32768, 32767);
+    view.setInt16(i * 2, s, Endian.little);
+  }
+  final out = BytesBuilder();
+  void str(String s) => out.add(s.codeUnits);
+  void u32(int v) => out.add([v & 0xff, (v >> 8) & 0xff, (v >> 16) & 0xff, (v >> 24) & 0xff]);
+  void u16(int v) => out.add([v & 0xff, (v >> 8) & 0xff]);
+  str('RIFF'); u32(36 + dataSize); str('WAVE');
+  str('fmt '); u32(16); u16(1); u16(1);          // PCM, mono
+  u32(sampleRate); u32(sampleRate * 2); u16(2); u16(16); // byte rate, block align, bits
+  str('data'); u32(dataSize);
+  out.add(pcm);
+  return out.toBytes();
+}
+
 /// Records a fixed window from the mic and returns the samples (16 kHz mono).
 /// Returns null if microphone permission is denied.
 Future<Float32List?> recordSamples(Duration duration) async {

@@ -8,11 +8,15 @@ class ChatMessage {
   final bool fromUser;
   final String text;
 
+  /// Memory citation for an answer (shown in a box under the bubble), or null.
+  final String? reference;
+
   const ChatMessage({
     this.id = 0,
     required this.timestamp,
     required this.fromUser,
     required this.text,
+    this.reference,
   });
 }
 
@@ -26,14 +30,20 @@ class ChatStore {
   static Future<ChatStore> create() async {
     final db = await openDatabase(
       p.join(await getDatabasesPath(), 'chat.db'),
-      version: 1,
+      version: 2,
       onCreate: (db, _) => db.execute(
         'CREATE TABLE messages ('
         'id INTEGER PRIMARY KEY AUTOINCREMENT, '
         'timestamp INTEGER NOT NULL, '
         'from_user INTEGER NOT NULL, '
-        'text TEXT NOT NULL)',
+        'text TEXT NOT NULL, '
+        'reference TEXT)',
       ),
+      onUpgrade: (db, from, to) async {
+        if (from < 2) {
+          await db.execute('ALTER TABLE messages ADD COLUMN reference TEXT');
+        }
+      },
     );
     return ChatStore._(db);
   }
@@ -44,12 +54,14 @@ class ChatStore {
       'timestamp': m.timestamp.millisecondsSinceEpoch,
       'from_user': m.fromUser ? 1 : 0,
       'text': m.text,
+      'reference': m.reference,
     });
     return ChatMessage(
       id: id,
       timestamp: m.timestamp,
       fromUser: m.fromUser,
       text: m.text,
+      reference: m.reference,
     );
   }
 
@@ -67,6 +79,7 @@ class ChatStore {
         timestamp: DateTime.fromMillisecondsSinceEpoch(r['timestamp'] as int),
         fromUser: (r['from_user'] as int) == 1,
         text: r['text'] as String,
+        reference: r['reference'] as String?,
       );
 
   Future<void> dispose() => _db.close();

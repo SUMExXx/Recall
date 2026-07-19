@@ -33,5 +33,8 @@ abstract interface class VectorStore {
   /// Memories most similar to [query], best first.
   Future<List<Memory>> search(String query, {int topK = 20});
 
+  /// Permanently removes the memories with these row ids.
+  Future<void> delete(List<int> ids);
+
   Future<void> dispose();
 }

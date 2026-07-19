@@ -21,6 +21,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--db", default="demo_hub.db")
     ap.add_argument("--port", type=int, default=8000)
+    # 0.0.0.0 so phones on the LAN can reach the sync WebSocket. Pass
+    # --host 127.0.0.1 to keep it local-only.
+    ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--seed", action="store_true",
                     help="seed the sample demo data (default: start empty)")
     ap.add_argument("--backend", default=None, choices=["npu", "ollama", "hash"],
@@ -55,6 +58,11 @@ def main():
     asr_how = (f"in-process faster-whisper ({cfg.whisper_model})"
                if type(asr).__name__ == "FasterWhisperProvider"
                else f"http server at {cfg.whisper_url}")
+    import socket
+    try:
+        lan_ip = socket.gethostbyname(socket.gethostname())
+    except OSError:
+        lan_ip = "<pc-lan-ip>"
     print(f"""
 Recall PC Hub
   backend    {cfg.backend}   (RECALL_BACKEND / pc/.env)
@@ -63,6 +71,7 @@ Recall PC Hub
   dream      consolidation every {cfg.consolidate_every_s:.0f}s (idle Dream tier)
   dashboard  http://localhost:{args.port}
   mic        http://localhost:{args.port}/capture
+  phone sync ws://{lan_ip}:{args.port}/ws   (enter in the app's PC-sync dialog)
 """)
 
     import uvicorn
@@ -83,7 +92,7 @@ Recall PC Hub
     # only shared-state bugs. If you need to scale request handling, that has
     # to go through a shared store (Postgres) + a shared pub/sub for the WS
     # fabric first; don't set workers>1 on this app before that exists.
-    uvicorn.run("hub.app:app", host="127.0.0.1", port=args.port,
+    uvicorn.run("hub.app:app", host=args.host, port=args.port,
                 log_level=cfg.log_level.lower())
 
 

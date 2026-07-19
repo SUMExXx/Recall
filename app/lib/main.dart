@@ -3,6 +3,7 @@ import 'package:onnxruntime/onnxruntime.dart';
 import 'package:sherpa_onnx/sherpa_onnx.dart' as sherpa;
 
 import 'home_page.dart';
+import 'theme.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -18,10 +19,10 @@ class RecallApp extends StatelessWidget {
   Widget build(BuildContext context) {
     return MaterialApp(
       title: 'Recall',
-      theme: ThemeData(
-        colorSchemeSeed: const Color(0xFF6750A4),
-        useMaterial3: true,
-      ),
+      debugShowCheckedModeBanner: false,
+      theme: AppTheme.light(),
+      darkTheme: AppTheme.dark(),
+      themeMode: ThemeMode.system, // dark-first design, follows the phone
       home: const HomePage(),
     );
   }

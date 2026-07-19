@@ -315,17 +315,27 @@ class Retriever:
                          + json.dumps(okf, ensure_ascii=False)[:1200] + "\n\n")
         prompt = (
             "You are Recall, an on-device memory assistant. Answer the question "
-            "using ONLY the memory excerpts below. Cite the source of each fact you use in your answer "
-            "of the excerpts you used. If the excerpts do not contain the "
-            "answer, reply exactly NOTFOUND.\n\n"
+            "directly and concisely using ONLY the memory excerpts below. State "
+            "the answer itself in the first sentence — do NOT say things like "
+            "'the answer can be found in the excerpt' or 'according to the "
+            "memory', and do NOT add citations, sources, or bracketed ids "
+            "(those are attached automatically). If the excerpts do not contain "
+            "the answer, reply exactly NOTFOUND.\n\n"
             f"{okf_block}MEMORY EXCERPTS:\n{context_str}\n\nQUESTION: {query}\nANSWER:")
         with step("llm_synthesize", backend=self.backend.name,
                   model=getattr(self.llm, "model", self.llm.name),
                   prompt_chars=len(prompt)) as s:
             s.detail(prompt=prompt)
             try:
-                answer = self.llm.generate(prompt)
+                answer = self.llm.generate(prompt).strip()
                 s.detail(response=answer)
+                # Attach the REAL citation in code — the model can't be trusted
+                # to copy ids accurately (it parrots example ids). The top-ranked
+                # context is the primary source.
+                if answer and "NOTFOUND" not in answer.upper():
+                    top = contexts[0]
+                    src = top.chunk_title or top.title or top.source_type
+                    answer += f"\nSource: {top.citation()} ({src})"
                 return answer
             except Exception as e:
                 s.detail(fallback=f"LLM unavailable: {e}")
