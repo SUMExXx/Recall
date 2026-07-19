@@ -15,17 +15,26 @@ license = { text = "Apache-2.0" }
 # (RECALL_BACKEND=ollama) never has to install them.
 dependencies = [
     "numpy>=1.26",
-    "sqlite-vec>=0.1.7",
     "pydantic>=2.7",
     "pydantic-settings>=2.3",
     "fastapi>=0.115",
-    "uvicorn[standard]>=0.30",
+    "uvicorn>=0.30",    # NOT uvicorn[standard]: that extra pulls in httptools,
+                        # which has no prebuilt wheel for win_arm64 (Snapdragon
+                        # X Elite) and fails to compile without a full MSVC C++
+                        # toolchain. Plain uvicorn (h11) is all this app needs —
+                        # we don't run with --reload, so watchfiles isn't needed.
     "httpx>=0.27",
     "requests>=2.31",
     "mcp>=1.2",
     "tokenizers>=0.20",
     "python-dotenv>=1.0",
     "websockets>=12",   # Sarvam streaming TTS (wss://.../text-to-speech/ws)
+    # mcp -> pyjwt[crypto] -> cryptography. Pinned because cryptography only
+    # ships a prebuilt win_arm64 wheel for 46.0.x; any other version pip picks
+    # falls back to an sdist that needs a Rust toolchain (cargo/maturin) with
+    # the aarch64-pc-windows-msvc target + link.exe, which isn't set up on the
+    # event PC.
+    "cryptography>=46.0.0,<47",
 ]
 
 [project.optional-dependencies]
@@ -34,6 +43,11 @@ dependencies = [
 # imports and runs (on the ollama/hash backend) without any of these present.
 npu = [
     "onnxruntime-qnn; platform_machine == 'ARM64'",  # QNN EP: Nomic v1.5, Whisper, reranker
+    # In-process LLM: auto-pulls the precompiled AI Hub bundle and runs it on
+    # the Hexagon NPU (npu_llm_mode auto/geniex). Pure-python sdist (native
+    # runtime fetched by the package itself) — installs with no compiler.
+    # Only functions on Snapdragon, hence the marker.
+    "geniex>=0.3; platform_machine == 'ARM64'",
     "transformers>=4.44",                            # AutoTokenizer for Qwen3 / Nomic
     "onnx>=1.16",
 ]

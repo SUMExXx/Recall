@@ -89,6 +89,12 @@ def llm_extract_relation(sentence: str, llm=None) -> dict | None:
     """Escalation hook for ambiguous spans (plan §6): one (subject, predicate,
     object) triple via the backend LLM (Qwen3-4B on the NPU, llama3.2 on Ollama).
 
+    Despite the parameter name, the caller (consolidate.job_llm_relations)
+    passes a whole chunk — several sentences, not one — so the prompt asks for
+    the single most important relation in that TEXT rather than implying a
+    single-sentence input; the old wording invited the model to glue two
+    unrelated fragments together with "and"/"for" as a fake "predicate".
+
     Returns None when no LLM is available — the cheap extractors already handled
     the confident cases, so this is a no-op on the offline/hash backend.
     """
@@ -98,9 +104,15 @@ def llm_extract_relation(sentence: str, llm=None) -> dict | None:
 
     from .llm_validate import is_valid_relation
     from .tracing import step
-    prompt = ("Extract exactly one (subject, predicate, object) triple from the "
-             'sentence as JSON: {"subject":"","predicate":"","object":""}. '
-             f"Sentence: {sentence}")
+    prompt = (
+        "Read the TEXT below and extract the SINGLE most important factual "
+        "relationship in it as one (subject, predicate, object) triple. The "
+        "predicate must be a real verb phrase (e.g. \"is\", \"has\", "
+        "\"decided to\", \"will attend\", \"works at\") — NEVER a bare "
+        "conjunction or preposition like \"and\"/\"for\"/\"of\". If the text "
+        "has no clear relation, use predicate \"none\".\n"
+        'Return ONLY JSON: {"subject":"","predicate":"","object":""}\n\n'
+        f"TEXT: {sentence}")
     with step("extract_relation:llm_fallback",
              model=getattr(llm, "model", llm.name)) as s:
         s.detail(prompt=prompt)
@@ -113,10 +125,72 @@ def llm_extract_relation(sentence: str, llm=None) -> dict | None:
             return None
         if not d.get("subject") or not d.get("object"):
             return None
-        if not is_valid_relation(d["subject"], d["object"], sentence):
-            s.detail(rejected="object shares no vocabulary with the source "
-                             "sentence — likely hallucinated")
+        predicate = d.get("predicate") or "related_to"
+        if predicate.strip().lower() == "none":
+            s.detail(rejected="model reported no clear relation")
             return None
-    return {"subject": d["subject"],
-            "predicate": d.get("predicate", "related_to"),
-            "object": d["object"]}
+        if not is_valid_relation(d["subject"], d["object"], sentence, predicate):
+            s.detail(rejected="weak/conjunction predicate, or object shares no "
+                             "vocabulary with the source text — likely noise "
+                             "or hallucinated")
+            return None
+    return {"subject": d["subject"], "predicate": predicate, "object": d["object"]}
+
+
+def llm_extract_entities(text: str, llm=None) -> list[dict] | None:
+    """Escalation for the entities regex can't see: multi-word names regex
+    fragments (e.g. "Royal Enfield" + "GT" as two hits instead of one "Royal
+    Enfield GT"), and lowercase topical phrases regex-by-design never catches
+    at all ("office party", "flight to Noida") — these are exactly the shared
+    vocabulary that would let genuinely-related memories cluster/link, and
+    their absence is why cross-memory correlation stayed weak (see
+    [[pipeline-audit]]). Every candidate is validated as a real (case-
+    insensitive) substring of `text` before being trusted, so a model
+    inventing an entity that never appears in the source is silently dropped,
+    not written into the graph. Fragmented regex hits for the same name aren't
+    deleted here — job_entity_resolution's substring/fuzzy merge (consolidate.py)
+    already converges "royalenfield" into "royalenfieldgt" on its own.
+
+    Returns None when no LLM is available."""
+    if llm is None or not getattr(llm, "available", False):
+        return None
+    import json
+
+    from .tracing import step
+    prompt = (
+        "Extract the concrete named entities and short topic phrases in this "
+        "TEXT: people, places, organizations, products/models, and 2-4 word "
+        "event/topic phrases a person would search for later. Skip generic "
+        "words (\"today\", \"thing\"). Use each entity's EXACT wording as it "
+        "appears in the TEXT — do not paraphrase or normalize it.\n"
+        'Return ONLY JSON: {"entities":[{"name":"","type":"person|place|org|'
+        'product|event|topic"}]}\n\n'
+        f"TEXT: {text[:1000]}")
+    with step("extract_entities:llm", model=getattr(llm, "model", llm.name)) as s:
+        s.detail(prompt=prompt)
+        try:
+            raw = llm.generate(prompt, json=True, timeout=30.0)
+            s.detail(response=raw)
+            data = json.loads(raw)
+        except Exception as e:
+            s.detail(error=str(e))
+            return None
+        low = text.lower()
+        out: list[dict] = []
+        seen_spans: list[tuple[int, int]] = []
+        for item in data.get("entities", []) if isinstance(data, dict) else []:
+            name = (item.get("name") or "").strip()
+            if len(name) < 3:
+                continue
+            idx = low.find(name.lower())
+            if idx < 0:   # not actually in the source text -> hallucinated
+                continue
+            end = idx + len(name)
+            if any(idx >= s0 and end <= e0 for s0, e0 in seen_spans):
+                continue   # subsumed by an already-accepted (usually fuller) span
+            seen_spans.append((idx, end))
+            out.append({"name": text[idx:end],   # original casing from the text
+                        "type": item.get("type") or "topic",
+                        "start": idx, "end": end})
+        s.detail(entities=len(out))
+        return out

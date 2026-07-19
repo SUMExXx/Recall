@@ -66,6 +66,10 @@ log = logging.getLogger("recall.hub")
 EVENT_BUFFER = 500
 LED_STATES = ("idle", "capturing", "searching", "recalled", "muted", "error")
 SAMPLE_RATE = 16000
+# Seconds to wait after a capture finishes before the Dream tier may run, so a
+# fresh memory's dot renders and its writes settle before the heavy background
+# pass competes for the store (see maybe_dream).
+DREAM_SETTLE_GRACE_S = 8.0
 AUDIO_FLUSH_SECONDS = 4.0        # transcribe in ~4 s windows
 _AUDIO_FLUSH_BYTES = int(SAMPLE_RATE * 2 * AUDIO_FLUSH_SECONDS)
 
@@ -229,6 +233,7 @@ class HubState:
         self.health = {"llm": None, "db": True, "checked_at": 0.0}
         # Dream-tier scheduling: consolidate when idle, only if data changed.
         self._last_dream = time.time()
+        self._last_capture_end = 0.0   # set on meeting_end; gates the Dream tier
         self._dream_stats: dict | None = None
 
     # ------------------------------------------------------------ events
@@ -477,6 +482,13 @@ async def maybe_dream(s: HubState):
         return
     if s.sessions.active:            # someone is mid-capture — stay out of the way
         return
+    # Settle grace: a memory's dot appears on capture (the `memory_added` push),
+    # and the heavy linking/agentic pass is meant to run "somewhat later". If a
+    # big audio chunk has just finished ingesting, give the DB a moment to
+    # settle and the dot to render before competing for the store lock — else
+    # the Dream tier can delay the very dot the user is waiting to see.
+    if time.time() - s._last_capture_end < DREAM_SETTLE_GRACE_S:
+        return
     snap = s.store.stats()
     s._last_dream = time.time()
     if snap == s._dream_stats:
@@ -485,12 +497,18 @@ async def maybe_dream(s: HubState):
         # ensure_trace here (not around the outer async fn) keeps the trace
         # file write in this worker thread, off the event loop. run_full()'s
         # own ensure_trace("consolidate") attaches to this same trace, so one
-        # block shows every Dream-tier job's timing together.
+        # block shows every Dream-tier job's timing together. should_abort lets
+        # the pass yield the store the instant a new capture starts, so a fresh
+        # memory's dot never waits behind the LLM-heavy jobs.
         with ensure_trace("dream_tier"), s.metrics.timer("consolidate"):
-            return s.consolidator.run_full()
+            return s.consolidator.run_full(should_abort=lambda: s.sessions.active)
     t0 = time.perf_counter()
     out = await anyio.to_thread.run_sync(_dream)
-    s._dream_stats = s.store.stats()
+    # Only record the snapshot as "fully consolidated" when the pass actually
+    # finished; if it yielded to a capture, leave _dream_stats so the next idle
+    # cycle picks up the jobs it skipped instead of waiting for fresh data.
+    if not out.get("aborted"):
+        s._dream_stats = s.store.stats()
     log.info("dream tier ran in %.0f ms: %s",
              (time.perf_counter() - t0) * 1000, out)
     await s.broadcast("consolidated", out)
@@ -567,6 +585,111 @@ app = FastAPI(title="Recall PC Hub", version="2.0", lifespan=lifespan)
 
 
 # ------------------------------------------------------------------ REST
+
+# ---------------------------------------------------------------- extension wiring
+
+class InjectRequest(BaseModel):
+    text: str
+
+class InjectResponse(BaseModel):
+    ok: bool
+    memory_id: str | None = None
+
+@app.get("/state")
+async def state_ep():
+    """Extension calls GET /state to test connectivity."""
+    s = get_state()
+    return {"ok": True, "led": s.led_state, "backend": s.backend.name}
+
+@app.post("/demo/inject", response_model=InjectResponse)
+async def demo_inject(body: InjectRequest):
+    """Extension calls POST /demo/inject with {text} to store a memory."""
+    s = get_state()
+    def _ingest():
+        return s.ingestor.ingest_document(
+            source_type="note",
+            title=body.text[:60],
+            content=body.text,
+            source="chrome_extension",
+        )
+    memory_id = await anyio.to_thread.run_sync(_ingest)
+    return InjectResponse(ok=True, memory_id=memory_id)
+
+
+class IngestImageRequest(BaseModel):
+    # base64-encoded PNG/JPEG data URL ("data:image/png;base64,…") or raw base64
+    image: str
+    title: str | None = None
+    source_url: str | None = None
+    source_title: str | None = None
+
+class IngestImageResponse(BaseModel):
+    ok: bool
+    memory_id: str | None = None
+    description: str | None = None
+    error: str | None = None
+
+@app.post("/ingest/image", response_model=IngestImageResponse)
+async def ingest_image_ep(body: IngestImageRequest):
+    """
+    Accepts a screenshot (base64 PNG/JPEG, with or without the data-URL prefix)
+    from the Chrome extension, describes it with the vision-capable LLM backend,
+    then stores the description as a Recall memory.
+    """
+    s = get_state()
+
+    # Strip the data-URL prefix if present so we have raw base64
+    raw_b64 = body.image
+    if "," in raw_b64:
+        raw_b64 = raw_b64.split(",", 1)[1]
+
+    img_bytes = base64.b64decode(raw_b64)
+    title = body.title or "Screenshot"
+    source_meta: dict = {}
+    if body.source_url:
+        source_meta["url"] = body.source_url
+    if body.source_title:
+        source_meta["page_title"] = body.source_title
+
+    def _describe_and_ingest():
+        # Ask the active backend to describe the image; fall back to a stub
+        # when the backend has no vision support (hash / offline modes).
+        description: str | None = None
+        try:
+            if hasattr(s.backend, "describe_image"):
+                description = s.backend.describe_image(img_bytes)
+        except Exception as exc:
+            log.warning("backend.describe_image failed: %s", exc)
+
+        if not description:
+            # Minimal fallback: record that we got an image so it is at least
+            # stored with whatever metadata the extension supplied.
+            description = (
+                f"[Screenshot from {body.source_url or 'unknown page'}] "
+                "(visual content — vision model unavailable)"
+            )
+
+        content = description
+        if body.source_url:
+            content += f"\n\n— from \"{body.source_title or ''}\" ({body.source_url})"
+
+        memory_id = s.ingestor.ingest_document(
+            source_type="image",
+            title=title,
+            content=content,
+            source_meta=source_meta,
+            source="chrome_extension",
+        )
+        return memory_id, description
+
+    try:
+        memory_id, description = await anyio.to_thread.run_sync(_describe_and_ingest)
+        return IngestImageResponse(ok=True, memory_id=memory_id, description=description)
+    except Exception as exc:
+        log.error("ingest_image failed: %s", exc)
+        return IngestImageResponse(ok=False, error=str(exc))
+
+
 
 @app.get("/health", response_model=HealthResponse)
 async def health():
@@ -754,13 +877,70 @@ async def memory_detail_ep(memory_id: str):
     }
 
 
+_CLUSTER_LABEL_CACHE: dict[frozenset, str] = {}
+_LABEL_STOP = {"the", "and", "for", "with", "this", "that", "have", "has", "are",
+               "was", "our", "your", "about", "into", "just", "like", "very",
+               "today", "here", "there", "what", "when", "where", "which",
+               "some", "will", "from", "they", "them", "we", "is", "a", "an",
+               "of", "to", "in", "on", "my", "so", "it", "at"}
+
+
+def _deterministic_label(titles: list[str]) -> str:
+    """Instant, LLM-free cluster name: the most frequent meaningful word across
+    the member titles. Used as the always-available fallback."""
+    import re as _re
+    from collections import Counter
+    words: Counter = Counter()
+    for t in titles:
+        for w in _re.findall(r"[A-Za-z]{3,}", (t or "").lower()):
+            if w not in _LABEL_STOP:
+                words[w] += 1
+    return words.most_common(1)[0][0].title() if words else "Related"
+
+
+def _cluster_label(members: frozenset, titles: list[str], llm) -> str:
+    """A short human topic for a cluster. Cached by member-set so the LLM is
+    only asked once per distinct cluster (the dashboard polls /links often).
+    Falls back to a deterministic keyword label on any LLM failure."""
+    if members in _CLUSTER_LABEL_CACHE:
+        return _CLUSTER_LABEL_CACHE[members]
+    label = _deterministic_label(titles)
+    if llm is not None and getattr(llm, "available", False):
+        try:
+            listing = "; ".join(t.strip()[:80] for t in titles if t)
+            out = llm.generate(
+                "Give a SHORT topic label (1-3 words, Title Case, no quotes or "
+                "punctuation) that captures what these related notes have in "
+                f"common:\n{listing}\n\nLabel:", timeout=15.0).strip()
+            out = out.splitlines()[0].strip().strip('"').strip(".")
+            if out and len(out) <= 32:
+                label = out
+        except Exception:
+            pass
+    _CLUSTER_LABEL_CACHE[members] = label
+    return label
+
+
 @app.get("/links")
-async def links_ep(threshold: float = Query(0.55)):
+async def links_ep(threshold: float = Query(0.7)):
     """Correlation edges between memories — feeds the dashboard constellation.
 
-    score = 0.6 * embedding cosine (mean chunk vector) + 0.4 * shared-entity
-    overlap, and each edge carries `why` (the entities both memories mention)
-    so a line is explainable, not vague."""
+    score = embedding cosine (mean chunk vector) + a shared-entity BOOST.
+
+    The old form was a convex blend `0.6*cosine + 0.4*overlap`, which made an
+    edge mathematically unreachable in normal data: with no shared entity a
+    link needed cosine >= 0.55/0.6 = 0.917 (near-duplicate), and the 0.4 entity
+    term alone topped out at 0.4 < threshold, so entity overlap could NEVER
+    create a link on its own. That's why the constellation had zero lines.
+
+    Now cosine carries the edge and shared entities (people/things both
+    memories mention) add up to +0.3. But because this embedder rates even
+    unrelated memories at cosine ~0.55, a modest threshold on the blended
+    score linked nearly every pair and union-find collapsed the constellation
+    into one or two giant blobs. So the bar is asymmetric: an entity-backed
+    edge is admitted on the blended score, while a pure-semantic edge (no
+    shared entity) must clear `threshold` on COSINE ALONE. `why` lists the
+    shared entities so a line is explainable, not vague."""
     s = get_state()
     with s.store.lock:
         rows = s.store.db.execute(
@@ -771,6 +951,10 @@ async def links_ep(threshold: float = Query(0.55)):
             """SELECT DISTINCT em.memory_id, em.entity_id, em.entity_text
                FROM entity_mentions em JOIN memories m
                  ON m.memory_id = em.memory_id WHERE m.archived = 0""").fetchall()
+        title_rows = s.store.db.execute(
+            """SELECT memory_id, COALESCE(title, content, '') AS t
+               FROM memories WHERE archived = 0""").fetchall()
+    titles = {r["memory_id"]: r["t"] for r in title_rows}
     by_mem: dict[str, list] = {}
     _expected_bytes = DIM_FULL * 4   # float32
     for r in rows:
@@ -798,14 +982,53 @@ async def links_ep(threshold: float = Query(0.55)):
             overlap = (len(shared) / min(len(ents.get(a, set())) or 1,
                                          len(ents.get(b, set())) or 1)
                        if shared else 0.0)
-            score = 0.6 * float(sim[i, j]) + 0.4 * min(1.0, overlap)
-            if score >= threshold:
+            cos = float(sim[i, j])
+            score = min(1.0, cos + 0.3 * min(1.0, overlap))
+            # This embedder rates even UNRELATED memories at cosine ~0.55
+            # (measured: mean 0.56, max 0.75 across a real corpus), so a plain
+            # `score >= threshold` at a modest threshold links almost every
+            # pair and union-find collapses the whole constellation into one or
+            # two giant blobs. A shared entity is strong, independent evidence
+            # of a real relationship, so entity-backed edges are admitted on
+            # the blended score; a pure-semantic edge (no shared entity) must
+            # instead clear the threshold on COSINE ALONE, which only genuinely
+            # similar memories do.
+            linked = (score >= threshold) if shared else (cos >= threshold)
+            if linked:
                 why = sorted((ent_text[e] for e in shared),
                              key=str.lower)[:3]
                 edges.append({"a": a, "b": b, "score": round(score, 3),
                               "why": why})
     edges.sort(key=lambda e: -e["score"])
-    return edges[:200]
+    edges = edges[:200]
+
+    # Name each connected component (union-find over the surviving edges) so
+    # the dashboard shows a real topic instead of the generic "related". Labels
+    # are cached by member-set, so the LLM is consulted only when a NEW cluster
+    # appears — the frequent polling stays cheap.
+    parent: dict[str, str] = {}
+
+    def find(x):
+        parent.setdefault(x, x)
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for e in edges:
+        parent[find(e["a"])] = find(e["b"])
+    comps: dict[str, set] = {}
+    for e in edges:
+        comps.setdefault(find(e["a"]), set()).update((e["a"], e["b"]))
+    label_of: dict[str, str] = {}
+    for root, members in comps.items():
+        key = frozenset(members)
+        lbl = _cluster_label(key, [titles.get(m, "") for m in members], s.backend.llm)
+        for m in members:
+            label_of[m] = lbl
+    for e in edges:
+        e["label"] = label_of.get(e["a"], "")
+    return edges
 
 
 @app.get("/communities")
@@ -972,6 +1195,7 @@ async def ws_endpoint(ws: WebSocket):
                     with s.metrics.timer("ingest_meeting"):
                         return s.sessions.end(device_id)
                 memory_id = await anyio.to_thread.run_sync(_end)
+                s._last_capture_end = time.time()   # gates the Dream tier grace
                 log.info("meeting_end device=%s -> memory %s", device_id,
                          memory_id or "(no utterances — nothing ingested)")
                 await s.set_led("idle")

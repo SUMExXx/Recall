@@ -4,57 +4,203 @@
   <meta charset="utf-8" />
   <title>Recall — Settings</title>
   <style>
-    body {
-      font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      max-width: 420px;
-      margin: 40px auto;
-      color: #1a1a2e;
-      padding: 0 16px;
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:      #12100c;
+      --surface: #1b1812;
+      --surface2:#221e16;
+      --line:    #332d21;
+      --ink:     #ece7db;
+      --muted:   #a39b8a;
+      --amber:   #f0a030;
+      --amber-dim:rgba(240,160,48,.1);
+      --amber-border:rgba(240,160,48,.25);
+      --green:   #57c87b;
+      --red:     #e8837c;
+      --mono:    "Cascadia Code","SF Mono",Consolas,ui-monospace,monospace;
     }
-    h1 { font-size: 18px; margin-bottom: 4px; }
-    p.muted { color: #777; font-size: 13px; }
-    label { display: block; font-weight: 600; margin: 20px 0 6px; font-size: 13px; }
+
+    body {
+      background: var(--bg);
+      color: var(--ink);
+      font: 13px/1.6 var(--mono);
+      min-height: 100vh;
+      padding: 0;
+    }
+
+    .page {
+      max-width: 480px;
+      margin: 0 auto;
+      padding: 40px 24px 60px;
+    }
+
+    /* header */
+    .page-header {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 32px;
+      padding-bottom: 20px;
+      border-bottom: 1px solid var(--line);
+    }
+    .logo-mark {
+      width: 34px; height: 34px;
+      border-radius: 9px;
+      background: var(--amber-dim);
+      border: 1px solid var(--amber-border);
+      display: flex; align-items: center; justify-content: center;
+      flex: none;
+    }
+    .page-title { font-size: 17px; font-weight: 700; letter-spacing: .02em; }
+    .page-title span { color: var(--amber); }
+    .page-sub { font-size: 11px; color: var(--muted); margin-top: 2px; }
+
+    /* field groups */
+    .field-group {
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 16px 18px;
+      margin-bottom: 14px;
+    }
+    .field-label {
+      display: block;
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: .1em;
+      color: var(--muted);
+      margin-bottom: 8px;
+    }
+    .field-hint {
+      font-size: 11px;
+      color: var(--muted);
+      margin-bottom: 10px;
+      line-height: 1.5;
+    }
+    .field-hint code {
+      color: var(--amber);
+      background: var(--amber-dim);
+      border: 1px solid var(--amber-border);
+      border-radius: 4px;
+      padding: 1px 5px;
+      font: inherit;
+    }
+
     input[type="text"] {
       width: 100%;
-      padding: 9px 10px;
-      border: 1px solid #ddd;
-      border-radius: 8px;
-      font: inherit;
-      box-sizing: border-box;
+      background: var(--surface2);
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      padding: 9px 11px;
+      font: 13px/1 var(--mono);
+      color: var(--ink);
+      outline: none;
+      transition: border-color .15s;
+      caret-color: var(--amber);
     }
-    button {
-      margin-top: 14px;
-      background: #4f46e5;
-      color: #fff;
+    input[type="text"]::placeholder { color: #5a5244; }
+    input[type="text"]:focus {
+      border-color: var(--amber-border);
+      box-shadow: 0 0 0 3px rgba(240,160,48,.08);
+    }
+
+    /* action row */
+    .action-row {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-top: 16px;
+    }
+
+    button.primary {
+      background: var(--amber);
+      color: var(--bg);
       border: none;
-      border-radius: 8px;
-      padding: 9px 16px;
-      font: 600 13px/1 inherit;
+      border-radius: 7px;
+      padding: 9px 18px;
+      font: 700 12px/1 var(--mono);
       cursor: pointer;
+      letter-spacing: .04em;
+      transition: opacity .15s;
     }
-    button:hover { background: #4338ca; }
-    #result { margin-top: 12px; font-size: 13px; }
-    .ok { color: #16a34a; }
-    .err { color: #dc2626; }
+    button.primary:hover { opacity: .85; }
+    button.primary:disabled { opacity: .4; cursor: default; }
+
+    /* result badge */
+    #result {
+      font-size: 12px;
+      padding: 8px 12px;
+      border-radius: 7px;
+      display: none;
+    }
+    #result.ok {
+      display: block;
+      color: var(--green);
+      background: rgba(87,200,123,.08);
+      border: 1px solid rgba(87,200,123,.2);
+    }
+    #result.err {
+      display: block;
+      color: var(--red);
+      background: rgba(232,131,124,.08);
+      border: 1px solid rgba(232,131,124,.2);
+    }
+    #result.testing {
+      display: block;
+      color: var(--muted);
+      background: var(--surface);
+      border: 1px solid var(--line);
+    }
   </style>
 </head>
 <body>
-  <h1>Recall — Settings</h1>
-  <p class="muted">
-    Point this at your PC hub's address — e.g. <code>http://192.168.1.42:8000</code>
-    if your laptop and the hub are on the same demo hotspot, or
-    <code>http://localhost:8000</code> if the hub runs on this machine.
-  </p>
+  <div class="page">
 
-  <label for="hub-url">Hub URL</label>
-  <input type="text" id="hub-url" placeholder="http://localhost:8000" />
+    <div class="page-header">
+      <div class="logo-mark">
+        <svg width="18" height="18" viewBox="0 0 14 14" fill="none">
+          <circle cx="7" cy="7" r="2.5" fill="#f0a030"/>
+          <circle cx="2" cy="4"  r="1.2" fill="#a39b8a" opacity=".7"/>
+          <circle cx="12" cy="4" r="1.2" fill="#a39b8a" opacity=".7"/>
+          <circle cx="2" cy="10" r="1.2" fill="#a39b8a" opacity=".7"/>
+          <circle cx="12" cy="10" r="1.2" fill="#a39b8a" opacity=".7"/>
+          <line x1="4.5" y1="5.5"  x2="7"  y2="7"   stroke="#f0a030" stroke-width=".8" opacity=".5"/>
+          <line x1="9.5" y1="5.5"  x2="7"  y2="7"   stroke="#f0a030" stroke-width=".8" opacity=".5"/>
+          <line x1="4.5" y1="8.5"  x2="7"  y2="7"   stroke="#f0a030" stroke-width=".8" opacity=".5"/>
+          <line x1="9.5" y1="8.5"  x2="7"  y2="7"   stroke="#f0a030" stroke-width=".8" opacity=".5"/>
+        </svg>
+      </div>
+      <div>
+        <div class="page-title">Re<span>call</span> — settings</div>
+        <div class="page-sub">extension configuration</div>
+      </div>
+    </div>
 
-  <label for="github-token">GitHub token (optional)</label>
-  <input type="text" id="github-token" placeholder="ghp_… (only needed for private repos / higher rate limits)" />
+    <div class="field-group">
+      <label class="field-label" for="hub-url">hub address</label>
+      <p class="field-hint">
+        The PC hub's network address. Use <code>http://localhost:8000</code> if the hub
+        runs on this machine, or <code>http://192.168.x.x:8000</code> on a demo hotspot.
+      </p>
+      <input type="text" id="hub-url" placeholder="http://localhost:8000" />
+    </div>
 
-  <button id="save">Save &amp; test connection</button>
-  <div id="result"></div>
+    <div class="field-group">
+      <label class="field-label" for="github-token">GitHub token <span style="color:#5a5244;font-size:10px;text-transform:none;letter-spacing:0">(optional)</span></label>
+      <p class="field-hint">
+        Only needed for private repos or to raise API rate limits. Generate one at
+        <code>github.com/settings/tokens</code> with <code>repo</code> scope.
+      </p>
+      <input type="text" id="github-token" placeholder="ghp_…" />
+    </div>
 
+    <div class="action-row">
+      <button class="primary" id="save">save &amp; test</button>
+      <div id="result"></div>
+    </div>
+
+  </div>
   <script src="options.js"></script>
 </body>
 </html>

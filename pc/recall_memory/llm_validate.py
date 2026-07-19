@@ -55,14 +55,30 @@ def is_valid_llm_summary(response: str, facts: str, min_chars: int = 15,
     return len(_content_words(text) & _content_words(facts)) >= min_overlap
 
 
-def is_valid_relation(subject: str, object_: str, source_text: str) -> bool:
-    """A (subject, predicate, object) triple is acceptable only if the
-    object shares vocabulary with the sentence it was extracted from —
-    catches triples hallucinated from unrelated context (e.g. a Whisper
-    hallucination loop bleeding into the same chunk). An object with no
-    content words of its own (too short/generic to judge) is let through
-    rather than false-rejected."""
+_WEAK_PREDICATES = {
+    "and", "or", "but", "so", "nor", "yet", "for", "of", "in", "on", "at",
+    "by", "with", "to", "the", "a", "an", "as", "then", "also",
+}
+
+
+def is_valid_relation(subject: str, object_: str, source_text: str,
+                      predicate: str = "") -> bool:
+    """A (subject, predicate, object) triple is acceptable only if:
+    (a) the object shares vocabulary with the text it was extracted from —
+        catches triples hallucinated from unrelated context (e.g. a Whisper
+        hallucination loop bleeding into the same chunk); an object with no
+        content words of its own (too short/generic to judge) is let through
+        rather than false-rejected;
+    (b) the predicate is an actual relation, not a bare conjunction/
+        preposition. The source chunk fed to the extractor is often several
+        sentences, not one — forcing exactly one triple from it invites the
+        model to glue two unrelated fragments together with "and"/"for" as
+        the "predicate" (observed in production traces, e.g. predicate="and"
+        linking "personal portfolio" to "Macathon winning"). That triple is
+        syntactically well-formed JSON but semantically empty."""
     if not subject or not object_:
+        return False
+    if predicate and predicate.strip().lower() in _WEAK_PREDICATES:
         return False
     obj_words = _content_words(object_)
     if not obj_words:

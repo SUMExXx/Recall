@@ -4,7 +4,12 @@
       "Bash(./.venv/Scripts/python.exe -m pip install \"websockets>=12\" -q)",
       "Bash(./.venv/Scripts/python.exe \"C:/Users/mayur/AppData/Local/Temp/claude/c--Users-mayur-Desktop-Recall-Recall-2-0/ac40a708-5f14-4c57-a1b9-f927d3cbbf4a/scratchpad/probe_sarvam_stream.py\")",
       "Bash(./.venv/Scripts/python.exe -c ' *)",
-      "Bash(./.venv/Scripts/python.exe -m pytest tests/test_recall_memory.py -q -k \"ask_stream\" -v)"
+      "Bash(./.venv/Scripts/python.exe -m pytest tests/test_recall_memory.py -q -k \"ask_stream\" -v)",
+      "Bash(python -c \"import platform; print\\(platform.machine\\(\\), platform.system\\(\\)\\)\")",
+      "Bash(curl -s https://pypi.org/pypi/sqlite-vec/json)",
+      "Bash(python -c ' *)",
+      "Bash(gh api *)",
+      "Bash(curl -s https://api.github.com/repos/asg017/sqlite-vec/releases/latest)"
     ]
   }
 }

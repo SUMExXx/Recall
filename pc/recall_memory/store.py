@@ -6,7 +6,8 @@ chunks          universal retrieval unit, 3 metadata groups + emb_full float32 B
 entity_mentions cross-source bridge (indexed columns = the "hash index")
 relations       graph edges with bi-temporal fields (valid_at / invalid_at / transaction_at)
 fts_chunks      FTS5 BM25 over chunk text
-vec_chunks      sqlite-vec vec0, int8[256] Matryoshka coarse vectors (brute-force)
+vec_chunks      int8[256] Matryoshka coarse vectors, brute-force KNN via numpy
+                (not sqlite-vec/vec0 — that package has no win_arm64 wheel)
 """
 import json
 import re
@@ -165,14 +166,16 @@ CREATE TABLE IF NOT EXISTS communities (
 );
 """
 
-_VEC_SCHEMA = f"""
-CREATE VIRTUAL TABLE IF NOT EXISTS vec_chunks USING vec0(
-  chunk_id  INTEGER PRIMARY KEY,
-  mem_rowid INTEGER PARTITION KEY,
+_VEC_SCHEMA = """
+CREATE TABLE IF NOT EXISTS vec_chunks (
+  chunk_id    INTEGER PRIMARY KEY,
+  mem_rowid   INTEGER,
   created_at  INTEGER,
   source_type TEXT,
-  emb_coarse  int8[{DIM_COARSE}]
+  emb_coarse  BLOB
 );
+CREATE INDEX IF NOT EXISTS idx_vec_source_type ON vec_chunks(source_type);
+CREATE INDEX IF NOT EXISTS idx_vec_created_at ON vec_chunks(created_at);
 """
 
 _ENTITY_NORM_RE = re.compile(r"[^a-z0-9]+")
@@ -192,10 +195,6 @@ class MemoryStore:
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA busy_timeout=5000")   # wait, don't throw 'locked'
-        self.db.enable_load_extension(True)
-        import sqlite_vec
-        sqlite_vec.load(self.db)
-        self.db.enable_load_extension(False)
         self.db.executescript(_SCHEMA)
         self.db.executescript(_VEC_SCHEMA)
         self._migrate()
@@ -290,7 +289,7 @@ class MemoryStore:
             (chunk_id, chunk.text, chunk.memory_id))
         self.db.execute(
             """INSERT INTO vec_chunks(chunk_id, mem_rowid, created_at, source_type, emb_coarse)
-               VALUES (?,?,?,?,vec_int8(?))""",
+               VALUES (?,?,?,?,?)""",
             (chunk_id, mem_rowid, chunk.created_at, chunk.source_type,
              emb_coarse.astype(np.int8).tobytes()))
         return chunk_id
@@ -373,6 +372,13 @@ class MemoryStore:
             "SELECT 1 FROM entity_mentions WHERE entity_id=? LIMIT 1",
             (entity_id_for(term),)).fetchone() is not None
 
+    def entity_mention_exists(self, chunk_id: int, entity_id: str) -> bool:
+        """For the LLM entity-enrichment pass (ingest.py) to skip re-adding an
+        entity a chunk already has — regex ran first and may have caught it."""
+        return self.db.execute(
+            "SELECT 1 FROM entity_mentions WHERE chunk_id=? AND entity_id=? LIMIT 1",
+            (chunk_id, entity_id)).fetchone() is not None
+
     # ------------------------------------------------------ retrieval routes
 
     @staticmethod
@@ -420,9 +426,13 @@ class MemoryStore:
 
     def vector_search(self, emb_coarse_query: np.ndarray, filters: dict,
                       k: int = 200) -> list[tuple[int, float]]:
-        """Brute-force int8[256] KNN in vec0 with metadata pre-filters."""
-        conds, params = ["emb_coarse MATCH vec_int8(?)", "k = ?"], \
-                        [emb_coarse_query.astype(np.int8).tobytes(), k]
+        """Brute-force int8[256] KNN via numpy, with metadata pre-filters.
+
+        Score only has to preserve rank order — `_rrf_fuse` (retrieval.py)
+        fuses routes by rank position, not by this value, so an exact match
+        with sqlite-vec's internal distance formula isn't required.
+        """
+        conds, params = [], []
         if filters.get("source_type"):
             conds.append("source_type = ?")
             params.append(filters["source_type"])
@@ -430,11 +440,20 @@ class MemoryStore:
         if dr:
             conds.append("created_at BETWEEN ? AND ?")
             params.extend([int(dr[0]), int(dr[1])])
-        rows = self.db.execute(
-            f"SELECT chunk_id, distance FROM vec_chunks WHERE {' AND '.join(conds)}",
-            params).fetchall()
-        out = [(r["chunk_id"], 1.0 / (1.0 + r["distance"])) for r in rows]
-        # Non-vec0 filters (speaker, meeting) applied post-KNN on the chunk rows.
+        sql = "SELECT chunk_id, emb_coarse FROM vec_chunks"
+        if conds:
+            sql += " WHERE " + " AND ".join(conds)
+        rows = self.db.execute(sql, params).fetchall()
+        if not rows:
+            return []
+        chunk_ids = [r["chunk_id"] for r in rows]
+        mat = (np.frombuffer(b"".join(r["emb_coarse"] for r in rows), dtype=np.int8)
+                 .reshape(len(rows), DIM_COARSE).astype(np.int32))
+        q = emb_coarse_query.astype(np.int32)
+        dist = np.sum((mat - q) ** 2, axis=1)   # squared L2 over int8 vectors
+        order = np.argsort(dist, kind="stable")[:k]
+        out = [(chunk_ids[i], 1.0 / (1.0 + float(dist[i]))) for i in order]
+        # Non-vec metadata filters (speaker, meeting) applied post-KNN on the chunk rows.
         post = {k_: v for k_, v in filters.items()
                 if k_ in ("speaker", "meeting_id", "repo") and v}
         if post and out:

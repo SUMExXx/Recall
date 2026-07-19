@@ -11,12 +11,17 @@ This is the single seam the `RECALL_BACKEND` switch turns:
 """
 from __future__ import annotations
 
+import json
+import logging
+import re
 from functools import cached_property
 from typing import Protocol, runtime_checkable
 
 import numpy as np
 
 from ..config import RecallConfig
+
+log = logging.getLogger("recall.backends")
 
 
 @runtime_checkable
@@ -85,6 +90,73 @@ class PassthroughReranker:
     def rerank(self, query: str,
                candidates: list[tuple[int, float, str]]) -> list[tuple[int, float]]:
         return [(cid, score) for cid, score, _text in candidates]
+
+
+_JSON_RE = re.compile(r"\{.*\}", re.DOTALL)
+
+
+class LlmReranker:
+    """Cross-encoder-quality reranking via the on-device LLM (RankGPT-style
+    listwise scoring in ONE call).
+
+    The dedicated cross-encoder slot (Qwen3-Reranker ONNX / bge-reranker on
+    sentence-transformers) needs an asset or a torch stack we don't have on the
+    Snapdragon. Rather than leave the rerank step a no-op passthrough — which is
+    what the trace showed (`rerank 0.0 ms`, fused order untouched) — this asks
+    the LLM already loaded on the NPU to score each candidate's relevance to the
+    query on a 0..1 scale. That is a genuine (query, passage) judgment, so the
+    relevance-cutoff downstream finally has real scores to gate on.
+
+    One extra LLM call per query. Skips itself for <=1 candidate, and on ANY
+    parse/timeout failure returns the fused order unchanged so a query never
+    breaks because reranking hiccuped."""
+
+    name = "llm-listwise"
+
+    def __init__(self, llm, cfg: RecallConfig | None = None, max_text: int = 400):
+        self.llm = llm
+        self.max_text = max_text
+
+    _PROMPT = (
+        "You are a relevance judge for a personal-memory search engine. For "
+        "each PASSAGE, score how directly it ANSWERS the QUERY:\n"
+        "  1.0 = states the specific answer to the question\n"
+        "  0.5 = same general subject but does NOT actually answer it\n"
+        "  0.0 = unrelated\n"
+        "Judge meaning, not keyword overlap, and do not reward a passage just "
+        "for being about a similar subject (a note about a bike is NOT a good "
+        "answer to a question about a project). Return ONLY JSON, no prose:\n"
+        '{{"results":[{{"id":<passage number>,"score":<0.0-1.0>}}, ...]}}\n'
+        "one entry per passage.\n\nQUERY: {query}\n\nPASSAGES:\n{listing}")
+
+    def rerank(self, query: str,
+               candidates: list[tuple[int, float, str]]) -> list[tuple[int, float]]:
+        base = [(cid, score) for cid, score, _text in candidates]
+        if len(candidates) <= 1 or not getattr(self.llm, "available", False):
+            return base
+        listing = "\n".join(
+            f"[{i}] {(text or '').strip()[:self.max_text]}"
+            for i, (_cid, _sc, text) in enumerate(candidates))
+        try:
+            raw = self.llm.generate(
+                self._PROMPT.format(query=query, listing=listing),
+                json=True, timeout=30.0)
+            m = _JSON_RE.search(raw or "")
+            data = json.loads(m.group(0)) if m else {}
+            scores: dict[int, float] = {}
+            for item in data.get("results", []):
+                idx = int(item["id"])
+                if 0 <= idx < len(candidates):
+                    scores[candidates[idx][0]] = max(0.0, min(1.0, float(item["score"])))
+            if not scores:
+                return base
+            # candidates the judge omitted -> 0.0, so the cutoff can drop them
+            ranked = sorted(((cid, scores.get(cid, 0.0)) for cid, _s, _t in candidates),
+                            key=lambda t: -t[1])
+            return ranked
+        except Exception as e:
+            log.debug("llm reranker fell back to fused order: %s", e)
+            return base
 
 
 class Backend:

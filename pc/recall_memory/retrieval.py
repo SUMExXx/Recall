@@ -26,6 +26,11 @@ from .tracing import ensure_trace, step
 
 log = logging.getLogger("recall.retrieval")
 
+# How much the LLM listwise reranker's own score counts vs. the float cosine
+# when the two are blended (the rest is cosine). The small on-device LLM's
+# absolute relevance scores are noisy, so cosine is kept as an equal anchor.
+RERANK_BLEND = 0.5
+
 _CITATION_RE = re.compile(r"\s*\[[0-9a-f]{6,10}:\d+\]", re.IGNORECASE)
 
 
@@ -79,6 +84,23 @@ class RetrievedContext:
         return f"[{self.memory_id[:8]}:{self.chunk_id}]"
 
 
+def _fmt_ranked(items, n: int = 6) -> str:
+    """Render up to N (chunk_id, score, [text]) results as a compact, ordered
+    string for the trace — e.g. "12:0.812, 7:0.640(...), 3:0.511" — so a trace
+    read can compare exactly which candidates/scores survived at EACH stage,
+    not just how many. Every call site passes data already computed for that
+    stage (no extra DB reads) so this is pure formatting, not new I/O."""
+    if not items:
+        return "(none)"
+    out = []
+    for it in items[:n]:
+        cid, sc, *rest = it
+        text = f" {rest[0][:36]!r}" if rest and rest[0] else ""
+        out.append(f"{cid}:{sc:.3f}{text}")
+    more = f"  (+{len(items) - n} more)" if len(items) > n else ""
+    return ", ".join(out) + more
+
+
 def _rrf_fuse(route_lists: dict[str, list[tuple[int, float]]],
               weights: dict[str, float]) -> dict[int, float]:
     """Weighted RRF: score(d) = sum over routes of w_r / (k + rank_r(d))."""
@@ -127,25 +149,25 @@ class Retriever:
         if needs.get("bm25"):
             with step("retrieve:bm25", filters=filters) as s:
                 route_lists["bm25"] = self.store.bm25_search(query, filters)
-                s.detail(hits=len(route_lists["bm25"]))
+                s.detail(hits=len(route_lists["bm25"]), top=_fmt_ranked(route_lists["bm25"]))
         if needs.get("vector"):
             with step("retrieve:vector", k=COARSE_TOPK) as s:
                 coarse_q = matryoshka_coarse(query_vec[np.newaxis, :])[0]
                 route_lists["vector"] = self.store.vector_search(
                     coarse_q, filters, k=COARSE_TOPK)
-                s.detail(hits=len(route_lists["vector"]))
+                s.detail(hits=len(route_lists["vector"]), top=_fmt_ranked(route_lists["vector"]))
         if needs.get("entity_index"):
             with step("retrieve:entity_index", entities=plan.entities) as s:
                 route_lists["entity"] = self.store.entity_search(plan.entities, filters)
-                s.detail(hits=len(route_lists["entity"]))
+                s.detail(hits=len(route_lists["entity"]), top=_fmt_ranked(route_lists["entity"]))
         if needs.get("metadata_filter") and filters:
             with step("retrieve:metadata_filter", filters=filters) as s:
                 route_lists["metadata"] = self.store.metadata_search(filters)
-                s.detail(hits=len(route_lists["metadata"]))
+                s.detail(hits=len(route_lists["metadata"]), top=_fmt_ranked(route_lists["metadata"]))
         if needs.get("graph"):
             with step("retrieve:graph", entities=plan.entities) as s:
                 route_lists["graph"] = self.store.graph_search(plan.entities, filters)
-                s.detail(hits=len(route_lists["graph"]))
+                s.detail(hits=len(route_lists["graph"]), top=_fmt_ranked(route_lists["graph"]))
         log.debug("routes %s in %.0f ms",
                   {k: len(v) for k, v in route_lists.items()},
                   (time.perf_counter() - t0) * 1000)
@@ -153,17 +175,22 @@ class Retriever:
         profile = WEIGHT_PROFILES.get(plan.weight_profile, WEIGHT_PROFILES["general"])
         with step("fuse_rrf", weight_profile=plan.weight_profile) as s:
             fused = _rrf_fuse(route_lists, profile["routes"])
-            s.detail(candidates=len(fused))
+            top_fused = sorted(fused.items(), key=lambda kv: -kv[1])
+            s.detail(candidates=len(fused), top=_fmt_ranked(top_fused))
         if not fused:
             return []
 
         with step("boost_recency_importance") as s:
             boosted = self._boost(fused, profile["boost"])
-            s.detail(boost_weights=profile["boost"])
+            top_boosted = sorted(boosted.items(), key=lambda kv: -kv[1])
+            s.detail(boost_weights=profile["boost"], top=_fmt_ranked(top_boosted))
         top = sorted(boosted.items(), key=lambda kv: -kv[1])[:COARSE_TOPK]
         with step(f"rescore_float{DIM_FULL}_cosine") as s:
             scored = self._rescore(top, query_vec)
-            s.detail(candidates=len(scored))
+            # (chunk_id, blended_score, cosine) -> log both, cosine is what the
+            # relevance_cutoff below actually gates vector-only candidates on.
+            s.detail(candidates=len(scored),
+                     top=_fmt_ranked([(cid, sc, f"cos={cos:.3f}") for cid, sc, cos in scored]))
         cos_of = {cid: cos for cid, _s, cos in scored}
         rescored = [(cid, s) for cid, s, _cos in scored]
 
@@ -178,9 +205,25 @@ class Retriever:
                     if crow:
                         cands.append((cid, sc, crow["text"]))
                 reranked = self.reranker.rerank(query, cands)
+                # The on-device LLM reranker's ABSOLUTE listwise scores are
+                # noisy — it has ranked an off-topic passage above the right
+                # one (e.g. a "favorite bike" chunk at 0.99 for "what was my
+                # project"). Anchor each score to the float cosine already
+                # computed at 50/50: a candidate the LLM loves but cosine says
+                # is unrelated gets pulled back, and vice-versa. Passthrough
+                # returns the fused scores unchanged, so only a real (LLM /
+                # cross-encoder) reranker is blended.
+                if self.reranker.name != "passthrough":
+                    reranked = sorted(
+                        ((cid, RERANK_BLEND * rs
+                          + (1 - RERANK_BLEND) * cos_of.get(cid, 0.0))
+                         for cid, rs in reranked),
+                        key=lambda t: -t[1])
                 rerank_scores = dict(reranked)
                 rescored = reranked + rescored[RERANK_TOPK:]
-                s.detail(candidates=len(cands))
+                text_of = {cid: text for cid, _sc, text in cands}
+                s.detail(candidates=len(cands),
+                         top=_fmt_ranked([(cid, sc, text_of.get(cid, "")) for cid, sc in reranked]))
 
         # Relevance cutoff. Two independent signals, either can drop a
         # candidate:
@@ -199,24 +242,29 @@ class Retriever:
                         if route != "vector" for cid, _ in results}
             top_cos = max(cos_of.values(), default=0.0)
             before = len(rescored)
-            kept = []
+            kept, dropped_ids = [], []
             for cid, sc in rescored:
                 if is_real_reranker and cid in rerank_scores:
                     rs = rerank_scores[cid]
                     if rs < 0.1 or rs < 0.25 * top_rerank:
+                        dropped_ids.append(cid)
                         continue
                 elif top_cos > 0:
                     is_vec_only = cid not in evidence
                     cos = cos_of.get(cid, 0.0)
                     if is_vec_only and not (cos >= 0.40 and cos >= 0.6 * top_cos):
+                        dropped_ids.append(cid)
                         continue
                 kept.append((cid, sc))
             if kept:
                 rescored = kept
-            s.detail(before=before, after=len(rescored), dropped=before - len(rescored))
+            s.detail(before=before, after=len(rescored), dropped=before - len(rescored),
+                     dropped_ids=dropped_ids[:10], top=_fmt_ranked(rescored))
 
         with step("small_to_big_expand", top_k=top_k) as s:
             out = [self._expand(cid, sc) for cid, sc in rescored[:top_k]]
+            s.detail(top=_fmt_ranked([(c.chunk_id, c.score, c.chunk_title or c.title)
+                                      for c in out]))
             s.detail(contexts=len(out))
         return out
 
@@ -474,7 +522,18 @@ class Retriever:
 
     def _okf_for_contexts(self, contexts: list[RetrievedContext]) -> dict | None:
         """Skim-the-README (plan §7): if one source root dominates the hits and
-        it has an OKF manifest, hand that to the LLM first."""
+        it has an OKF manifest, hand that to the LLM first.
+
+        Dominance by CHUNK COUNT (>=2 contexts, or all of them, sharing a
+        source) is the original signal — it fires for a long meeting/PDF where
+        several hits land in the same document. It structurally can never fire
+        for a corpus of many single-chunk memories (each is its own "source",
+        so no root ever repeats) — which is why `okf_lookup attached=False` on
+        every ask against exactly that kind of corpus isn't a bug on its own.
+        Added: dominance by SCORE — when the #1 hit's score clearly leads the
+        rest, the answer is effectively about that one memory even though it
+        contributes only one chunk, so that memory's own OKF is still useful
+        framing. Purely additive: only creates NEW attachment opportunities."""
         from collections import Counter
         keymap = {"meeting": "meeting_id", "github_repo": "repo",
                   "pdf": "document_title"}
@@ -488,9 +547,15 @@ class Retriever:
             return None
         total = len(contexts)
         (stype, skey), n = roots.most_common(1)[0]
-        # attach when the hits are essentially about one source: either every
-        # context shares the root, or it holds a clear majority (>=2).
-        if not (n == total or n >= max(2, (total + 1) // 2)):
+        dominant = n == total or n >= max(2, (total + 1) // 2)
+        if not dominant and contexts:
+            top = contexts[0]
+            key = keymap.get(top.source_type)
+            val = top.meta.get(key) if key else None
+            second = contexts[1].score if len(contexts) > 1 else 0.0
+            if val and top.score > 0 and (second <= 0 or top.score >= 1.5 * second):
+                stype, skey, dominant = top.source_type, val, True
+        if not dominant:
             return None
         row = self.store.get_okf(stype, skey)
         return json.loads(row["manifest"]) if row else None

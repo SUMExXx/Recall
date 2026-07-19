@@ -251,6 +251,46 @@ def test_ollama_reranker_falls_back_when_sentence_transformers_missing(monkeypat
     assert OllamaBackend(cfg).reranker.name == "passthrough"
 
 
+# port 1 is never listening — the endpoint health probe fails fast
+_NPU_DEAD_ENDPOINT = "http://127.0.0.1:1"
+
+
+def test_npu_llm_mode_endpoint_always_http():
+    from recall_memory.backends.npu import NpuBackend, QwenGenieLLM
+    cfg = RecallConfig(backend="npu", npu_llm_mode="endpoint",
+                       npu_llm_endpoint=_NPU_DEAD_ENDPOINT)
+    assert isinstance(NpuBackend(cfg).llm, QwenGenieLLM)
+
+
+def test_npu_llm_mode_geniex_always_inprocess():
+    from recall_memory.backends.npu import GenieXInProcessLLM, NpuBackend
+    cfg = RecallConfig(backend="npu", npu_llm_mode="geniex")
+    assert isinstance(NpuBackend(cfg).llm, GenieXInProcessLLM)
+
+
+def test_npu_llm_auto_picks_geniex_when_endpoint_down(monkeypatch):
+    import importlib.util
+    from recall_memory.backends.npu import GenieXInProcessLLM, NpuBackend
+    monkeypatch.setattr(importlib.util, "find_spec",
+                        lambda name, *a: object() if name == "geniex" else None)
+    cfg = RecallConfig(backend="npu", npu_llm_mode="auto",
+                       npu_llm_endpoint=_NPU_DEAD_ENDPOINT)
+    assert isinstance(NpuBackend(cfg).llm, GenieXInProcessLLM)
+
+
+def test_npu_llm_auto_degrades_to_http_when_geniex_missing(monkeypatch):
+    """Neither a live endpoint nor geniex installed: the HTTP client (with
+    available=False) must come back so the engine's no-LLM degradation holds."""
+    import importlib.util
+    from recall_memory.backends.npu import NpuBackend, QwenGenieLLM
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name, *a: None)
+    cfg = RecallConfig(backend="npu", npu_llm_mode="auto",
+                       npu_llm_endpoint=_NPU_DEAD_ENDPOINT)
+    llm = NpuBackend(cfg).llm
+    assert isinstance(llm, QwenGenieLLM)
+    assert llm.available is False
+
+
 def test_local_transformers_reranker_sigmoid_normalizes_scores(monkeypatch):
     """bge-reranker-v2-m3 emits an unbounded logit, not a 0-1 score — without
     sigmoid-normalizing it, retrieval.py's relevance_cutoff has no meaningful

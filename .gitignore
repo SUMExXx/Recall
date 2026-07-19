@@ -15,3 +15,4 @@ pc/models/*.onnx
 pc/models/*.bin
 pc/models/*.json
 .env
+pc/models/nomic_embed_text-onnx-float/
