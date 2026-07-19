@@ -233,10 +233,12 @@ class GenieXInProcessLLM:
                 log.info("geniex: loading %s (device_map=%s) — downloads the "
                          "AI Hub bundle on first run", self.cfg.npu_llm_model,
                          self.cfg.npu_llm_device_map)
+                # progress left at None (geniex's own default progress UI) —
+                # this geniex version rejects progress=True ("must be
+                # callable, False, or None").
                 self._model = AutoModelForCausalLM.from_pretrained(
                     self.cfg.npu_llm_model,
-                    device_map=self.cfg.npu_llm_device_map,
-                    progress=True)
+                    device_map=self.cfg.npu_llm_device_map)
             except Exception as e:
                 self._failed = e
                 raise RuntimeError(
